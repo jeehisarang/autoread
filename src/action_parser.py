@@ -1,0 +1,129 @@
+"""OCR로 읽은 한 줄의 텍스트에서 홀덤 행동(Fold/Call/Raise/All-in 등)과
+스트리트(프리플랍/플랍/턴/리버), 새 핸드 시작 여부를 판별한다.
+
+특정 홀덤 프로그램의 문구에 완전히 맞추기는 어렵기 때문에,
+여러 홀덤 프로그램에서 흔히 쓰이는 한글/영문 표현을 폭넓게 인식하도록 만들었다.
+"""
+import re
+from dataclasses import dataclass
+
+# (표시용 영문 행동명, 정규식) - 위에서부터 우선 검사한다.
+# 실제 기록에 남기는 '핵심' 행동들 (플레이어가 직접 선택하는 행동)
+ACTION_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("All-in", re.compile(r"(all\s*-?\s*in|올\s*인)", re.I)),
+    ("Fold", re.compile(r"(fold|폴드|폴더)", re.I)),
+    ("Check", re.compile(r"(check|체크)", re.I)),
+    ("Raise", re.compile(r"(raise|레이즈|레이스)", re.I)),
+    ("Call", re.compile(r"(call|콜)", re.I)),
+    ("Bet", re.compile(r"(bet|벳|베팅)", re.I)),
+]
+LOGGED_ACTION_TYPES = {name for name, _ in ACTION_PATTERNS}
+
+# 플레이어의 선택이 아니라 게임 상태를 나타내는 것들 (기록하지 않지만, 상태 갱신에 사용)
+HAND_RESET_PATTERN = re.compile(
+    r"(new\s*game|new\s*hand|새\s*게임|새\s*핸드|다음\s*게임|딜러\s*버튼)", re.I
+)
+STREET_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("리버", re.compile(r"(river|리버)", re.I)),
+    ("턴", re.compile(r"\bturn\b|턴", re.I)),
+    ("플랍", re.compile(r"(flop|플랍)", re.I)),
+]
+BLIND_PATTERN = re.compile(
+    r"(small\s*blind|big\s*blind|ante|스몰\s*블라인드|빅\s*블라인드|앤티|\bsb\b|\bbb\b)", re.I
+)
+WIN_PATTERN = re.compile(r"(win|winner|showdown|쇼다운|승리|이겼습니다|획득)", re.I)
+OTHER_KEYWORD_PATTERNS = [BLIND_PATTERN, WIN_PATTERN]
+
+DEFAULT_STREET = "프리플랍"
+
+# \b로 앞뒤 경계를 강제해서, "PLAYER99" 같은 이름/아이디에 섞인 숫자를 금액으로 오인하지 않게 한다.
+AMOUNT_PATTERN = re.compile(r"\b(\d[\d,]*(?:\.\d+)?)\b\s*(원|칩|chip|point|pt)?", re.I)
+
+# 금액이 의미가 없는 행동 유형 (있어도 무시한다)
+ACTIONS_WITHOUT_AMOUNT = {"Fold", "Check"}
+
+# 한국어 문장에서 흔히 붙는 이름 뒤 조사들을 제거해서 플레이어 이름을 정리한다.
+NAME_SUFFIXES = ["님께서", "님이", "님은", "님의", "님을", "님", "이", "가", "은", "는"]
+
+
+@dataclass
+class ParsedAction:
+    kind: str  # "action" | "street" | "new_hand" | "result" | "other"
+    action_type: str  # 예: "Fold" (kind == "action"일 때만 값 있음)
+    player: str  # 추정된 플레이어 이름 (없으면 "")
+    amount: str  # 추정된 금액 문자열 (없으면 "")
+    raw_text: str  # OCR 원문
+    street_name: str  # 예: "플랍" (kind == "street"일 때만 값 있음)
+
+    @property
+    def is_new_hand(self) -> bool:
+        return self.kind == "new_hand"
+
+
+def matches_any_keyword(text: str) -> bool:
+    """텍스트가 행동/스트리트/새 핸드/기타 게임 키워드 중 하나라도 포함하는지."""
+    if HAND_RESET_PATTERN.search(text):
+        return True
+    for _, pattern in STREET_PATTERNS:
+        if pattern.search(text):
+            return True
+    for _, pattern in ACTION_PATTERNS:
+        if pattern.search(text):
+            return True
+    for pattern in OTHER_KEYWORD_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
+
+
+def _extract_player(text: str, action_span_start: int) -> str:
+    prefix = text[:action_span_start].strip()
+    if not prefix:
+        return ""
+    # 보통 "플레이어명(+조사) [금액] 행동 ..." 형태이므로, 맨 앞 토큰을 이름으로 간주한다.
+    token = re.split(r"[\s:>\-]+", prefix)[0]
+    for suf in NAME_SUFFIXES:
+        if token.endswith(suf) and len(token) > len(suf):
+            token = token[: -len(suf)]
+            break
+    return token.strip()
+
+
+def _extract_amount(text: str) -> str:
+    matches = AMOUNT_PATTERN.findall(text)
+    numbers = [m[0] for m in matches if len(m[0].replace(",", "").replace(".", "")) >= 2]
+    if not numbers:
+        return ""
+    # 여러 숫자가 섞여 있으면 가장 큰(자릿수가 많은) 숫자를 금액으로 추정한다.
+    return max(numbers, key=lambda n: len(n.replace(",", "")))
+
+
+def parse_line(raw_text: str) -> ParsedAction:
+    text = raw_text.strip()
+
+    if HAND_RESET_PATTERN.search(text):
+        return ParsedAction(kind="new_hand", action_type="", player="", amount="", raw_text=text, street_name="")
+
+    for street_name, pattern in STREET_PATTERNS:
+        if pattern.search(text):
+            return ParsedAction(kind="street", action_type="", player="", amount="", raw_text=text, street_name=street_name)
+
+    if BLIND_PATTERN.search(text):
+        return ParsedAction(kind="other", action_type="", player="", amount="", raw_text=text, street_name="")
+
+    m = WIN_PATTERN.search(text)
+    if m:
+        player = _extract_player(text, m.start())
+        return ParsedAction(kind="result", action_type="", player=player, amount="", raw_text=text, street_name="")
+
+    for action_name, pattern in ACTION_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            player = _extract_player(text, m.start())
+            amount = "" if action_name in ACTIONS_WITHOUT_AMOUNT else _extract_amount(text)
+            return ParsedAction(
+                kind="action", action_type=action_name, player=player, amount=amount,
+                raw_text=text, street_name="",
+            )
+
+    return ParsedAction(kind="other", action_type="", player="", amount="", raw_text=text, street_name="")

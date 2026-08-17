@@ -1,0 +1,12 @@
+# 로컬 전용 설정/실행 결과물 (다른 PC/사용자와 공유하지 않음)
+config.json
+*.xlsx
+*.xls
+
+# 개인 계정 정보가 담긴 참고 스크린샷
+image.png
+image-1.png
+
+# Python
+__pycache__/
+*.pyc
