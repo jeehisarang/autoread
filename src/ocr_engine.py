@@ -24,10 +24,16 @@ def is_language_available(lang: str = "ko") -> bool:
         return False
 
 
-def recognize_lines(img: Image.Image, lang: str = "ko", scale: float = 2.0) -> list[OcrLine]:
+def recognize_lines(img: Image.Image, lang: str = "ko", scale: float = 4.0) -> list[OcrLine]:
     """이미지에서 텍스트 줄 목록을 인식해서 반환한다 (세로 위치 순 정렬).
 
     좌표는 항상 원본 img 기준으로 정규화해서 반환한다 (scale 배율과 무관하게 일정).
+
+    scale 기본값은 2.0 -> 4.0 으로 올렸다 (2026-08-19, 실제 코인포커 캡처로 실측).
+    실제 좌석 크롭 크기(가로 150px 안팎)에서 2배는 "체크"/"호출" 태그를 놓쳤는데
+    4배는 둘 다 정확히 잡았고, 이미 잘 되던 케이스(예: "올인")는 그대로였다 -
+    회귀 없이 실제 효과가 있는 조정이었다. 대비 강화/이진화는 같은 크롭으로
+    테스트했을 때 오히려 더 나쁘거나 차이가 없어서 적용하지 않았다.
     """
     if img is None:
         return []

@@ -1,0 +1,22 @@
+{
+  "table_type": "8max",
+  "note": "[백업, 비활성] 2026-08-18 재실측. 'Playing Highest Stakes' 유튜브 영상 + 사용자가 선택한 영역(96,108,1391,980, 원본창 1920x1080) 기준. base_resolution은 그 선택 영역을 크롭했을 때의 크기(1295x872)와 맞아야 한다. 결과 패널(승패 로그) 위치는 아직 캡처가 없어 미정. 활성화하려면 이 파일 내용을 table_layout.json으로 복사할 것.",
+  "base_resolution": [1295, 872],
+  "hero_seat_index": 7,
+  "board_region": [420, 320, 720, 430],
+  "hole_cards_region": [560, 545, 675, 645],
+  "result_panel_region": null,
+  "action_zone_bottom_ratio": 0.35,
+  "dealer_marker_colors": ["white"],
+  "seats": [
+    {"index": 0, "label": "상단좌", "is_hero": false, "region": [70, 155, 330, 240]},
+    {"index": 1, "label": "상단중앙", "is_hero": false, "region": [480, 95, 700, 225]},
+    {"index": 2, "label": "상단우", "is_hero": false, "region": [890, 160, 1150, 245]},
+    {"index": 3, "label": "중단좌", "is_hero": false, "region": [0, 325, 260, 410]},
+    {"index": 4, "label": "중단우", "is_hero": false, "region": [955, 330, 1220, 415]},
+    {"index": 5, "label": "하단좌", "is_hero": false, "region": [95, 535, 345, 630]},
+    {"index": 6, "label": "하단우", "is_hero": false, "region": [865, 535, 1130, 630]},
+    {"index": 7, "label": "하단중앙 (나)", "is_hero": true, "region": [505, 545, 790, 715]}
+  ],
+  "clockwise_order": [0, 1, 2, 4, 6, 7, 5, 3]
+}

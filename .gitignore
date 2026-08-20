@@ -3,6 +3,10 @@ config.json
 *.xlsx
 *.xls
 
+# API 키 등 비밀값, AI 호출 로그
+.env
+ai_call_log.txt
+
 # 개인 계정 정보가 담긴 참고 스크린샷
 image.png
 image-1.png
@@ -10,3 +14,11 @@ image-1.png
 # Python
 __pycache__/
 *.pyc
+
+# 개발 중 임시로 쌓인 캡처/샘플/디버그 산출물 (코드 아님, 용량만 큼)
+capture/
+coinpoker_samples/
+debug_seats/
+video_frames/
+debug_board.png
+yt2_region.png

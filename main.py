@@ -1,27 +1,33 @@
 """홀덤 게임 텍스트 기록 프로그램 - 실행 진입점.
 
-사용법:
-  1. [게임 창 선택]으로 홀덤 프로그램 창을 지정한다.
-  2. [저장 파일 선택]으로 결과를 저장할 xlsx 파일을 지정한다.
-  3. [기록 시작]을 누르면, 창 전체에서 Fold/Call/Raise/All-in 같은 행동 텍스트만
-     내용 기준으로 골라서 포지션(UTG/HJ/CO/BTN/SB/BB)별로 자동 기록한다.
-     내 자리(화면 하단 중앙)의 행동은 초록색으로 구분해서 표시한다.
-     (좌석마다 위치가 달라도 상관없다. 영역 지정은 선택 사항이다.)
+사용법 (task.md "딜러 채팅 파서를 메인 파이프라인에 연결"):
+  1. [① 테이블 창 선택]으로 홀덤 테이블 창을 지정한다 (히어로 닉네임 자동 인식용 -
+     안 골라도 기록 자체는 되고, 그때는 모든 행동이 "포지션 ] 행동" 형식으로만 남는다).
+  2. [② 딜러 채팅 창 선택]으로 딜러 채팅 창을 지정한다 (필수).
+  3. [③ 저장 파일 선택]으로 결과를 저장할 xlsx 파일을 지정한다.
+  4. [기록 시작]을 누르면, 딜러 채팅 창을 주기적으로 캡처해서 프리플랍/플랍/턴/
+     리버 4개 컬럼을 OCR로 읽어 포지션/닉네임/행동/금액을 뽑고, 새 핸드가
+     시작되면 [N게임 시작]을 찍는다. 테이블 창을 골랐으면 그 창 하단 중앙
+     닉네임과 딜러 채팅 이름을 매칭해서 내 행동만 "나 : " 형식으로 구분한다.
+
+  기존 아우라/밝기/딜러버튼 기반 인식(src/recorder.py의 Recorder)은 그대로
+  남아있지만(삭제하지 않음), 이 화면에서는 더 이상 쓰지 않는다 - 딜러 채팅 기반
+  인식(DealerChatBridge)으로 대체됐다.
 """
 import os
 import sys
-import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import win32gui
+import win32api
+import win32event
+import winerror
 
 from src import config as cfg_mod
 from src import ocr_engine, window_capture
-from src.recorder import Recorder
-from src.region_select import select_region_from_screen
+from src.dealer_chat_bridge import DealerChatBridge
 from src.xlsx_writer import XlsxLogger
 
 FONT_NORMAL = ("맑은 고딕", 12)
@@ -32,6 +38,12 @@ FONT_LOG_HEADER = ("Consolas", 14, "bold")
 
 HERO_COLOR = "#1B7A1B"  # 내 행동 강조색 (초록)
 
+# 프로그램을 여러 개 동시에 켜면 같은 xlsx 파일에 서로 저장을 시도하면서 충돌하고
+# 행동이 누락되는 문제가 있었다. Windows 뮤텍스로 중복 실행 자체를 막는다 - 이 이름의
+# 뮤텍스는 프로세스가 (정상 종료든 강제 종료든) 끝나면 OS가 자동으로 해제하므로,
+# 이전 창을 안 닫고 잊어버려도 다음 실행 때 낡은 잠금이 남는 일은 없다.
+_SINGLE_INSTANCE_MUTEX_NAME = "Local\\HoldemTextRecorder_SingleInstance"
+
 
 class App:
     def __init__(self, root: tk.Tk):
@@ -41,23 +53,32 @@ class App:
 
         self.cfg = cfg_mod.load_config()
 
-        self.selected_hwnd: int | None = None
-        self.selected_title: str | None = self.cfg.get("window_title")
-        self.region: tuple | None = tuple(self.cfg["region"]) if self.cfg.get("region") else None
+        self.table_hwnd: int | None = None
+        self.table_title: str | None = self.cfg.get("table_window_title")
+        self.chat_hwnd: int | None = None
+        self.chat_title: str | None = self.cfg.get("chat_window_title")
         self.save_path: str | None = self.cfg.get("save_path")
         self.interval_sec = float(self.cfg.get("interval_sec", 0.8))
         self.ocr_lang = self.cfg.get("ocr_lang", "ko")
+        # task.md "히어로 닉네임 설정값 매칭": 좌석 OCR로 매번 재탐지하는 대신
+        # 사용자가 미리 넣어둔 닉네임으로 히어로를 식별한다. 비워두면 기존
+        # 좌석 OCR 자동 인식으로 폴백된다(DealerChatBridge 쪽에서 처리).
+        self.hero_nickname_var = tk.StringVar(value=self.cfg.get("hero_nickname", ""))
 
-        self.recorder: Recorder | None = None
+        self.recorder: DealerChatBridge | None = None
         self.xlsx_logger: XlsxLogger | None = None
 
         self._build_ui()
         self._check_ocr_language()
 
-        if self.selected_title:
-            hwnd = window_capture.find_window_by_title(self.selected_title)
+        if self.table_title:
+            hwnd = window_capture.find_window_by_title(self.table_title)
             if hwnd:
-                self.selected_hwnd = hwnd
+                self.table_hwnd = hwnd
+        if self.chat_title:
+            hwnd = window_capture.find_window_by_title(self.chat_title)
+            if hwnd:
+                self.chat_hwnd = hwnd
         self._refresh_labels()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -71,23 +92,31 @@ class App:
 
         row1 = tk.Frame(top)
         row1.pack(fill="x", pady=4)
-        tk.Button(row1, text="① 게임 창 선택", font=FONT_BOLD, width=18, command=self.on_select_window).pack(side="left")
-        self.lbl_window = tk.Label(row1, text="선택된 창: 없음", font=FONT_NORMAL, anchor="w")
-        self.lbl_window.pack(side="left", padx=10)
+        tk.Button(row1, text="① 테이블 창 선택", font=FONT_BOLD, width=18, command=self.on_select_table_window).pack(side="left")
+        self.lbl_table_window = tk.Label(row1, text="테이블 창: 없음", font=FONT_NORMAL, anchor="w")
+        self.lbl_table_window.pack(side="left", padx=10)
+
+        row1b = tk.Frame(top)
+        row1b.pack(fill="x", pady=4)
+        tk.Button(row1b, text="② 딜러 채팅 창 선택", font=FONT_BOLD, width=18, command=self.on_select_chat_window).pack(side="left")
+        self.lbl_chat_window = tk.Label(row1b, text="딜러 채팅 창: 없음", font=FONT_NORMAL, anchor="w")
+        self.lbl_chat_window.pack(side="left", padx=10)
 
         row2 = tk.Frame(top)
         row2.pack(fill="x", pady=4)
-        tk.Button(row2, text="② 저장 파일 선택", font=FONT_BOLD, width=18, command=self.on_select_save_path).pack(side="left")
+        tk.Button(row2, text="③ 저장 파일 선택", font=FONT_BOLD, width=18, command=self.on_select_save_path).pack(side="left")
         self.lbl_path = tk.Label(row2, text="저장 파일: 없음", font=FONT_NORMAL, anchor="w")
         self.lbl_path.pack(side="left", padx=10)
 
+        # task.md "히어로 닉네임 설정값 매칭": 기록 시작 전에 입력 가능, 비워두면
+        # 기존 좌석 OCR 자동 인식으로 폴백(DealerChatBridge._run 참고).
         row3 = tk.Frame(top)
         row3.pack(fill="x", pady=4)
-        tk.Button(
-            row3, text="(선택) 특정 영역만 캡처", font=FONT_NORMAL, width=18, command=self.on_select_region
+        tk.Label(row3, text="히어로 닉네임", font=FONT_BOLD, width=18, anchor="w").pack(side="left")
+        tk.Entry(row3, font=FONT_NORMAL, width=24, textvariable=self.hero_nickname_var).pack(side="left", padx=10)
+        tk.Label(
+            row3, text="(비워두면 테이블 하단 좌석에서 자동 인식)", font=FONT_NORMAL, fg="#666",
         ).pack(side="left")
-        self.lbl_region = tk.Label(row3, text="영역: 창 전체 (기본값, 보통 그대로 두면 됩니다)", font=FONT_NORMAL, anchor="w")
-        self.lbl_region.pack(side="left", padx=10)
 
         row4 = tk.Frame(top)
         row4.pack(fill="x", pady=10)
@@ -95,7 +124,6 @@ class App:
             row4, text="▶ 기록 시작", font=FONT_BIG, width=16, bg="#2e7d32", fg="white", command=self.on_toggle
         )
         self.btn_toggle.pack(side="left")
-        tk.Button(row4, text="다음 게임으로 넘기기", font=FONT_NORMAL, command=self.on_next_hand).pack(side="left", padx=10)
 
         self.lbl_status = tk.Label(self.root, text="상태: 대기 중", font=FONT_BOLD, fg="#333", anchor="w")
         self.lbl_status.pack(fill="x", padx=10)
@@ -130,39 +158,41 @@ class App:
             )
 
     def _refresh_labels(self):
-        self.lbl_window.config(text=f"선택된 창: {self.selected_title or '없음'}")
-        if self.region:
-            x1, y1, x2, y2 = self.region
-            self.lbl_region.config(
-                text=f"영역: 지정됨 (x={x1}, y={y1}, 크기 {x2 - x1} x {y2 - y1})"
-            )
-        else:
-            self.lbl_region.config(text="영역: 창 전체 (기본값, 보통 그대로 두면 됩니다)")
+        self.lbl_table_window.config(text=f"테이블 창: {self.table_title or '없음 (히어로 매칭 생략됨)'}")
+        self.lbl_chat_window.config(text=f"딜러 채팅 창: {self.chat_title or '없음'}")
         self.lbl_path.config(text=f"저장 파일: {self.save_path or '없음'}")
 
     # ---------- 이벤트 핸들러 ----------
-    def on_select_window(self):
-        windows = window_capture.enum_windows()
+    def _pick_window_dialog(self, dialog_title: str, list_label: str, prioritize_substr: str | None = None):
+        """창 선택 대화상자 - 작은/최소화/카카오톡 창은 목록에서 뺀다
+        (window_capture.filtered_windows, task.md [A] "이미 만든 2개 선택 UI/
+        필터를 메인에 연결"). prioritize_substr을 주면 그 문자열이 제목에 포함된
+        창을 목록 맨 위에 올린다. 반환: (hwnd, title) 또는 취소 시 (None, None)."""
+        windows = window_capture.filtered_windows(prioritize_substr)
         picker = tk.Toplevel(self.root)
-        picker.title("게임 창 선택")
+        picker.title(dialog_title)
         picker.geometry("560x420")
         picker.grab_set()
 
-        tk.Label(picker, text="기록할 홀덤 게임 창을 선택하세요", font=FONT_BOLD).pack(pady=6)
+        tk.Label(picker, text=list_label, font=FONT_BOLD).pack(pady=6)
 
         listbox = tk.Listbox(picker, font=FONT_NORMAL)
         listbox.pack(fill="both", expand=True, padx=10, pady=6)
+        # 같은 제목의 창이 여러 개 떠 있으면(예: CoinPoker 창을 두 개 켠 경우)
+        # 제목만으로는 구분이 안 돼서, 창 크기와 화면 위치도 같이 보여준다.
         for w in windows:
-            listbox.insert("end", w.title)
+            mark = "★ " if prioritize_substr and prioritize_substr.lower() in w.title.lower() else ""
+            listbox.insert("end", f"{mark}{w.title}   ({w.width}x{w.height})  @ ({w.left}, {w.top})")
+
+        result = {}
 
         def confirm(_event=None):
             sel = listbox.curselection()
             if not sel:
                 return
             chosen = windows[sel[0]]
-            self.selected_hwnd = chosen.hwnd
-            self.selected_title = chosen.title
-            self._refresh_labels()
+            result["hwnd"] = chosen.hwnd
+            result["title"] = chosen.title
             picker.destroy()
 
         listbox.bind("<Double-Button-1>", confirm)
@@ -171,47 +201,24 @@ class App:
         tk.Button(btn_row, text="선택", font=FONT_NORMAL, command=confirm).pack(side="left", padx=6)
         tk.Button(btn_row, text="취소", font=FONT_NORMAL, command=picker.destroy).pack(side="left", padx=6)
 
-    def on_select_region(self):
-        if not self.selected_hwnd:
-            messagebox.showinfo("안내", "먼저 게임 창을 선택해주세요.")
-            return
+        self.root.wait_window(picker)
+        return result.get("hwnd"), result.get("title")
 
-        try:
-            win32gui.ShowWindow(self.selected_hwnd, 9)  # SW_RESTORE (최소화 상태면 복원)
-            win32gui.SetForegroundWindow(self.selected_hwnd)
-        except Exception:
-            pass
-        self.root.update()
-        time.sleep(0.3)  # 창이 앞으로 나오고 다시 그려질 시간을 준다.
-
-        abs_coords = select_region_from_screen(self.root)
-        if abs_coords is None:
-            self.region = None
+    def on_select_table_window(self):
+        hwnd, title = self._pick_window_dialog(
+            "① 테이블 창 선택", "홀덤 테이블 창을 선택하세요 (히어로 닉네임 자동 인식용)"
+        )
+        if hwnd is not None:
+            self.table_hwnd, self.table_title = hwnd, title
             self._refresh_labels()
-            return
 
-        try:
-            wl, wt, wr, wb = win32gui.GetWindowRect(self.selected_hwnd)
-        except Exception:
-            messagebox.showerror("오류", "창 위치를 확인할 수 없습니다. 창 전체를 사용합니다.")
-            self.region = None
+    def on_select_chat_window(self):
+        hwnd, title = self._pick_window_dialog(
+            "② 딜러 채팅 창 선택", "딜러 채팅 창을 선택하세요", prioritize_substr="딜러 채팅"
+        )
+        if hwnd is not None:
+            self.chat_hwnd, self.chat_title = hwnd, title
             self._refresh_labels()
-            return
-
-        win_w, win_h = wr - wl, wb - wt
-        x1 = max(0, min(win_w, abs_coords[0] - wl))
-        y1 = max(0, min(win_h, abs_coords[1] - wt))
-        x2 = max(0, min(win_w, abs_coords[2] - wl))
-        y2 = max(0, min(win_h, abs_coords[3] - wt))
-
-        if x2 - x1 < 5 or y2 - y1 < 5:
-            messagebox.showwarning(
-                "안내", "선택한 영역이 게임 창 밖에 있습니다. 창 전체를 사용합니다."
-            )
-            self.region = None
-        else:
-            self.region = (x1, y1, x2, y2)
-        self._refresh_labels()
 
     def on_select_save_path(self):
         path = filedialog.asksaveasfilename(
@@ -224,13 +231,6 @@ class App:
             self.save_path = path
             self._refresh_labels()
 
-    def on_next_hand(self):
-        if self.recorder and self.recorder.is_running():
-            n = self.recorder.next_hand()
-            self.set_status(f"수동으로 {n}번째 게임으로 넘어갔습니다.")
-        else:
-            messagebox.showinfo("안내", "기록이 시작된 상태에서만 사용할 수 있습니다.")
-
     def on_toggle(self):
         if self.recorder and self.recorder.is_running():
             self.stop_recording()
@@ -238,8 +238,8 @@ class App:
             self.start_recording()
 
     def start_recording(self):
-        if not self.selected_hwnd:
-            messagebox.showinfo("안내", "먼저 게임 창을 선택해주세요.")
+        if not self.chat_hwnd:
+            messagebox.showinfo("안내", "먼저 딜러 채팅 창을 선택해주세요.")
             return
         if not self.save_path:
             messagebox.showinfo("안내", "먼저 저장할 엑셀 파일을 선택해주세요.")
@@ -255,12 +255,13 @@ class App:
         self.txt_log.delete("1.0", "end")
         self.txt_log.configure(state="disabled")
 
-        self.recorder = Recorder(
-            hwnd=self.selected_hwnd,
-            region=self.region,
+        self.recorder = DealerChatBridge(
+            chat_hwnd=self.chat_hwnd,
+            table_hwnd=self.table_hwnd,
             xlsx_logger=self.xlsx_logger,
             interval_sec=self.interval_sec,
             ocr_lang=self.ocr_lang,
+            hero_nickname=self.hero_nickname_var.get().strip(),
             on_line=self._on_line,
             on_status=self.set_status,
         )
@@ -292,11 +293,12 @@ class App:
     def _save_config(self):
         self.cfg.update(
             {
-                "window_title": self.selected_title,
-                "region": list(self.region) if self.region else None,
+                "table_window_title": self.table_title,
+                "chat_window_title": self.chat_title,
                 "save_path": self.save_path,
                 "interval_sec": self.interval_sec,
                 "ocr_lang": self.ocr_lang,
+                "hero_nickname": self.hero_nickname_var.get().strip(),
             }
         )
         cfg_mod.save_config(self.cfg)
@@ -309,7 +311,24 @@ class App:
 
 
 def main():
+    # 뮤텍스를 함수 지역변수로만 들고 있어도 root.mainloop()가 끝날 때까지는 이
+    # 스택 프레임이 살아있으므로 핸들이 유지된다(중간에 GC로 풀리지 않는다).
+    mutex = win32event.CreateMutex(None, False, _SINGLE_INSTANCE_MUTEX_NAME)
+    already_running = win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS
+
     root = tk.Tk()
+    if already_running:
+        root.withdraw()
+        messagebox.showwarning(
+            "이미 실행 중",
+            "홀덤 게임 텍스트 기록 프로그램이 이미 실행되고 있습니다.\n"
+            "같은 프로그램을 여러 개 동시에 켜면 같은 저장 파일에 서로 저장하려다\n"
+            "충돌해서 행동 기록이 누락될 수 있습니다.\n\n"
+            "기존에 열려있는 창을 사용해주세요(작업표시줄에서 찾아보세요).",
+        )
+        root.destroy()
+        return
+
     try:
         style = ttk.Style()
         style.theme_use(style.theme_use())

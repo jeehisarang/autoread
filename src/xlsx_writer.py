@@ -11,7 +11,9 @@ from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
 HEADERS = ["시간", "게임 번호", "스트리트", "포지션", "행동", "금액", "내 행동", "원문(OCR)"]
-HERO_FONT = Font(color="1B7A1B", bold=True)  # 초록색 + 굵게 (내 행동 강조)
+AMOUNT_COL = HEADERS.index("금액") + 1  # openpyxl은 1부터 시작
+# task.md "내 행동 구분 표시" - 빨간색 + 굵게로 강조(기존엔 초록색이었음).
+HERO_FONT = Font(color="C00000", bold=True)
 
 
 class XlsxLogger:
@@ -21,6 +23,7 @@ class XlsxLogger:
         self._wb = None
         self._ws = None
         self.last_error: str | None = None
+        self.last_row: int | None = None
         self._open_or_create()
 
     def _open_or_create(self) -> None:
@@ -64,10 +67,18 @@ class XlsxLogger:
     def append(self, row: list, highlight: bool = False) -> bool:
         with self._lock:
             self._ws.append(row)
+            last_row = self._ws.max_row
+            self.last_row = last_row  # task.md "베팅 금액 보완" - 나중에 금액을 채워 넣을 때 씀
             if highlight:
-                last_row = self._ws.max_row
                 for col in range(1, len(row) + 1):
                     self._ws.cell(row=last_row, column=col).font = HERO_FONT
+            return self._save()
+
+    def update_amount(self, row: int, amount: str) -> bool:
+        """행동을 기록할 때는 금액을 못 읽었지만, 몇 프레임 뒤(칩 숫자가 화면에
+        남아있는 동안) 다시 읽는 데 성공하면 그 행 "금액" 칸만 채워 넣는다."""
+        with self._lock:
+            self._ws.cell(row=row, column=AMOUNT_COL, value=amount)
             return self._save()
 
     def row_count(self) -> int:

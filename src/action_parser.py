@@ -10,12 +10,16 @@ from dataclasses import dataclass
 # (표시용 영문 행동명, 정규식) - 위에서부터 우선 검사한다.
 # 실제 기록에 남기는 '핵심' 행동들 (플레이어가 직접 선택하는 행동)
 ACTION_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("All-in", re.compile(r"(all\s*-?\s*in|올\s*인)", re.I)),
-    ("Fold", re.compile(r"(fold|폴드|폴더)", re.I)),
-    ("Check", re.compile(r"(check|체크)", re.I)),
-    ("Raise", re.compile(r"(raise|레이즈|레이스)", re.I)),
-    ("Call", re.compile(r"(call|콜)", re.I)),
-    ("Bet", re.compile(r"(bet|벳|베팅)", re.I)),
+    ("All-in", re.compile(r"(all\s*-?\s*in|올\s*인|맥스)", re.I)),
+    # "fld"/"f0ld"는 실제 속도 테스트에서 확인된 "FOLD" OCR 오인식(짧게 스친 프레임에서
+    # 'O'가 탈락하거나 '0'으로 오인식됨, 예: fLD/FLD/F0LD) - Fold 패턴 한 곳에서 같이 관리한다.
+    ("Fold", re.compile(r"(fold|f[o0]?ld|폴드|폴더|다이|겹)", re.I)),
+    ("Check", re.compile(r"(check|체크|첵)", re.I)),
+    # "테이즈"는 코인포커 실측에서 확인된 "레이즈" OCR 오인식(4배 업스케일 적용 후에도
+    # 첫 글자가 계속 틀림) - 유사 글자 보정으로 동의어 취급한다.
+    ("Raise", re.compile(r"(raise|레이즈|레이스|따당|테이즈)", re.I)),
+    ("Call", re.compile(r"(call|콜|호출)", re.I)),
+    ("Bet", re.compile(r"(bet|벳|베팅|베트|쿼터|하프|내기)", re.I)),
 ]
 LOGGED_ACTION_TYPES = {name for name, _ in ACTION_PATTERNS}
 
@@ -36,8 +40,15 @@ OTHER_KEYWORD_PATTERNS = [BLIND_PATTERN, WIN_PATTERN]
 
 DEFAULT_STREET = "프리플랍"
 
-# \b로 앞뒤 경계를 강제해서, "PLAYER99" 같은 이름/아이디에 섞인 숫자를 금액으로 오인하지 않게 한다.
-AMOUNT_PATTERN = re.compile(r"\b(\d[\d,]*(?:\.\d+)?)\b\s*(원|칩|chip|point|pt)?", re.I)
+# (?<!\w)로 앞쪽 경계만 강제해서, "PLAYER99" 같은 이름/아이디에 섞인 숫자를 금액으로
+# 오인하지 않게 한다. 뒤쪽은 \b를 쓰지 않는다 - "1000골드"처럼 숫자 뒤에 한글 단위가
+# 공백 없이 바로 붙는 경우(\d와 한글 모두 \w라 그 사이엔 \b가 성립하지 않는다) 금액을
+# 놓치기 때문이다(실측 OCR 결과로 확인).
+AMOUNT_PATTERN = re.compile(r"(?<!\w)(\d[\d,]*(?:\.\d+)?)(?:\s*(원|골드|칩|chip|point|pt))?", re.I)
+
+# "1만골드", "23만 4184골드"처럼 한글 만 단위로 표기된 금액. \d000 형태가 아니라서
+# AMOUNT_PATTERN만으로는 못 읽는다(실측 로그에서 베트/콜 금액의 상당수가 이 형태였음).
+KOREAN_MAN_PATTERN = re.compile(r"(?<!\w)(\d[\d,]*)\s*만(?:\s*(\d[\d,]*))?", re.I)
 
 # 금액이 의미가 없는 행동 유형 (있어도 무시한다)
 ACTIONS_WITHOUT_AMOUNT = {"Fold", "Check"}
@@ -90,6 +101,12 @@ def _extract_player(text: str, action_span_start: int) -> str:
 
 
 def _extract_amount(text: str) -> str:
+    man_match = KOREAN_MAN_PATTERN.search(text)
+    if man_match:
+        man = int(man_match.group(1).replace(",", ""))
+        rest = int(man_match.group(2).replace(",", "")) if man_match.group(2) else 0
+        return str(man * 10000 + rest)
+
     matches = AMOUNT_PATTERN.findall(text)
     numbers = [m[0] for m in matches if len(m[0].replace(",", "").replace(".", "")) >= 2]
     if not numbers:
@@ -127,3 +144,40 @@ def parse_line(raw_text: str) -> ParsedAction:
             )
 
     return ParsedAction(kind="other", action_type="", player="", amount="", raw_text=text, street_name="")
+
+
+# 화면 우측 "내기록" 패널 한 줄 형식: "닉네임 : +52만 골드" / "닉네임 : -13만 골드".
+# 콜론 바로 뒤에 +/-가 오는 것만 승패 결과로 보고, "일러비(딜러비) -1만8200골드"처럼
+# 부호 앞에 다른 말이 낀 줄(수수료 등)은 걸러낸다.
+RESULT_LINE_PATTERN = re.compile(r"^(.+?)\s*[:：]\s*([+\-])\s*(.+)$")
+
+
+def parse_result_line(raw_text: str):
+    """(닉네임, 부호, 금액문자열) 을 반환한다. 형식에 안 맞으면 None."""
+    m = RESULT_LINE_PATTERN.match(raw_text.strip())
+    if not m:
+        return None
+    nickname, sign, rest = m.group(1).strip(), m.group(2), m.group(3)
+    amount = _extract_amount(rest)
+    if not nickname or not amount:
+        return None
+    return nickname, sign, amount
+
+
+# 코인포커: 별도 결과 패널이 없고, 이긴 좌석의 홀카드 위에 "+3,181"처럼 부호+금액만
+# 잠깐 뜬다(실측 확인, 닉네임은 안 붙어 있음 - 그 좌석 이름표에 이미 나와 있어서).
+# 부호 없이 순수 숫자만 있는 줄(스택 액수 등)과 헷갈리지 않게 "+"로 시작하는지만 본다.
+WIN_AMOUNT_PATTERN = re.compile(r"^\+\s*(.+)$")
+
+
+def parse_win_amount(raw_text: str) -> str:
+    """"+3,181" 같은 줄에서 금액 문자열만 뽑는다. 형식에 안 맞으면 빈 문자열."""
+    m = WIN_AMOUNT_PATTERN.match(raw_text.strip())
+    if not m:
+        return ""
+    return _extract_amount(m.group(1))
+
+
+# 베팅 칩 옆에 뜨는 "2,000" 같은 순수 금액 텍스트용 (부호도 행동 단어도 없음).
+def extract_amount_from_text(text: str) -> str:
+    return _extract_amount(text)

@@ -8,7 +8,8 @@ DEFAULT_CONFIG = {
     "window_title": None,      # 마지막으로 선택한 창 제목 (참고용, hwnd는 재실행시 바뀌므로 제목으로 재탐색)
     "region": None,            # [x1, y1, x2, y2]  (창 내부 상대좌표, None이면 창 전체)
     "save_path": None,         # 저장할 xlsx 경로
-    "interval_sec": 0.8,       # 캡처 주기(초)
+    "interval_sec": 0.2,       # 캡처 주기(초). 실제 처리시간(0.4~0.5초)보다 낮게 잡아서
+                               # 인터벌이 병목이 되지 않고 처리 속도가 곧 주기가 되게 한다.
     "ocr_lang": "ko",          # Windows OCR 언어 태그
 }
 
