@@ -66,7 +66,7 @@ class DealerChatBridge:
         self.on_line = on_line
         self.on_status = on_status
 
-        self._recorder = DealerChatRecorder(layout=load_layout(), ocr_lang=ocr_lang)
+        self._recorder = DealerChatRecorder(layout=load_layout(), ocr_lang=ocr_lang, interval_sec=interval_sec)
         # task.md "히어로 닉네임 설정값 매칭": 설정값이 있으면 그 세션 내내
         # 고정으로 쓰고(매 폴링 좌석 OCR 재탐지 안 함), 비어있을 때만 기존처럼
         # 매 폴링 좌석 OCR로 찾는다(_run 참고). 매칭 규칙(완전일치/접두어/편집거리1)
@@ -95,6 +95,12 @@ class DealerChatBridge:
         self._cur_hand_no: int = 0
         self._cur_hand_board_count: int = 0
         self._cur_hand_headers: set = set()
+
+        # task4.md "히어로 폴드 시 보드 확인도 함께 중단": 히어로가 폴드로 확정된
+        # hand_no를 여기 모아둔다. 새 핸드는 매번 새 hand_no를 받으므로(증가만
+        # 함) 별도 리셋 없이 멤버십만 확인해도 새 핸드는 항상 깨끗하게 시작된다
+        # (지연/렉 없음 - task4.md "새 핸드 시작 시 느려지면 안 됨").
+        self._folded_hands: set = set()
 
     def start(self) -> None:
         self._stop_flag.clear()
@@ -219,6 +225,10 @@ class DealerChatBridge:
         expected_count = BOARD_STREET_COUNTS.get(street)
         if expected_count is None or table_img is None:
             return
+        # task4.md: 히어로가 이 핸드에서 이미 폴드했으면 보드 AI 호출 자체를 새로
+        # 시작하지 않는다.
+        if hand_no in self._folded_hands:
+            return
         key = (hand_no, street)
         if key in self._board_attempted:
             return
@@ -240,6 +250,11 @@ class DealerChatBridge:
         )
 
     def _on_board_cards_done(self, future, hand_no: int, street: str) -> None:
+        # task4.md "이미 진행 중인 보드 AI 요청이 있으면 결과를 버리거나 무시":
+        # 제출 시점엔 안 폴드였어도, 응답이 도착하는 사이 히어로가 폴드했을 수
+        # 있다 - 그 사이 값이면 결과를 그냥 버린다(로그/엑셀에 안 남김).
+        if hand_no in self._folded_hands:
+            return
         try:
             cards = future.result()
         except Exception:
@@ -324,7 +339,20 @@ class DealerChatBridge:
                     # (task.md 4절 포맷: "[N게임 시작]" 다음 줄에 "내 홀카드: ...").
                     self._submit_hero_cards(table_img, item.hand_no)
 
-            if table_img is not None and self._cur_hand_no and not self._recorder.syncing:
+            # task4.md "히어로 폴드 시 보드 확인도 함께 중단": recorder가 히어로
+            # 폴드를 확정한 순간(_hero_folded_this_hand) 이 핸드 번호를 기록해
+            # 둔다. process_frame은 폴드 처리 직후 그 핸드 동안은 더 이상 아무
+            # 항목도 내보내지 않으므로(위 for 루프가 매 폴링 비어있게 됨), 아래
+            # 로컬 보드 장수 보정 블록이 유일하게 남는 누출 경로였다.
+            if self._recorder._hero_folded_this_hand:
+                self._folded_hands.add(self._cur_hand_no)
+
+            if (
+                table_img is not None
+                and self._cur_hand_no
+                and not self._recorder.syncing
+                and self._cur_hand_no not in self._folded_hands
+            ):
                 # task.md "스트리트 헤더 보정(보드 장수 신호)": 딜러 채팅에 행동
                 # 텍스트가 하나도 없는 스트리트(예: 전원 체크로 넘어간 플랍)는 위
                 # 루프에서 recorder가 street_header를 절대 안 준다 - 로컬 보드 장수

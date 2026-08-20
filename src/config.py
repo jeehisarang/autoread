@@ -11,6 +11,8 @@ DEFAULT_CONFIG = {
     "interval_sec": 0.2,       # 캡처 주기(초). 실제 처리시간(0.4~0.5초)보다 낮게 잡아서
                                # 인터벌이 병목이 되지 않고 처리 속도가 곧 주기가 되게 한다.
     "ocr_lang": "ko",          # Windows OCR 언어 태그
+    "hero_nickname": "",       # 마지막으로 입력한 히어로 닉네임 (task.md "최근 목록 + 자동 저장")
+    "recent_hero_names": [],   # 최근 사용한 히어로 닉네임 최대 3개 (최신순)
 }
 
 

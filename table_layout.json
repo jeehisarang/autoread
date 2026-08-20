@@ -1,9 +1,9 @@
 {
-  "table_type": "6max",
-  "note": "2026-08-19 실제 실행 중인 코인포커 창(클라이언트 영역 869x635)을 직접 캡처해서 재실측. 이전 table_layout.json(7max, 영상 기준)은 실제 이 창의 6인석 배치와 안 맞아서 table_layout.7max.json 으로 백업. hole_cards_region/hero_action_buttons_region은 관전 모드라 실제 활성 플레이어 화면이 없어 이전 값 기준으로 추정만 하고 미검증(아래 필드 설명 참고).",
-  "hero_seat_index": 4,
-  "board_region": [0.2877, 0.3780, 0.6904, 0.5276],
-  "hole_cards_region": [0.42, 0.85, 0.58, 0.97],
+  "table_type": "7max",
+  "note": "2026-08-19 코인포커용 실측(1030x720 캡처 기준)을 창 너비/높이 비율로 환산. 창 크기가 바뀌어도 이 비율에 실제 캡처 크기를 곱해서 좌표를 구한다. ClubWPT GOLD 좌표는 table_layout.clubwpt.json 에 백업.",
+  "hero_seat_index": 6,
+  "board_region": [0.2913, 0.3611, 0.6311, 0.5069],
+  "hole_cards_region": [0.4417, 0.7014, 0.5485, 0.8403],
   "hero_action_buttons_region": [0.5728, 0.8403, 0.9369, 0.9722],
   "result_panel_region": null,
   "action_zone_bottom_ratio": 1.0,
@@ -11,12 +11,13 @@
   "dealer_zone_top_trim": 0.0167,
   "result_zone_top_extend": 0.1389,
   "seats": [
-    {"index": 0, "label": "상단좌", "is_hero": false, "region": [0.0437, 0.2126, 0.2244, 0.3228]},
-    {"index": 1, "label": "상단중앙", "is_hero": false, "region": [0.4143, 0.1102, 0.5811, 0.2283]},
-    {"index": 2, "label": "상단우", "is_hero": false, "region": [0.7882, 0.2126, 0.9551, 0.3228]},
-    {"index": 3, "label": "하단우", "is_hero": false, "region": [0.7940, 0.6220, 0.9609, 0.7323]},
-    {"index": 4, "label": "하단중앙 (나)", "is_hero": true, "region": [0.4143, 0.7717, 0.5811, 0.9134]},
-    {"index": 5, "label": "하단좌", "is_hero": false, "region": [0.0403, 0.6299, 0.2071, 0.7323]}
+    {"index": 0, "label": "상단좌", "is_hero": false, "region": [0.1456, 0.2431, 0.2961, 0.3542]},
+    {"index": 1, "label": "상단우", "is_hero": false, "region": [0.6796, 0.2431, 0.8301, 0.3542]},
+    {"index": 2, "label": "중단좌", "is_hero": false, "region": [0.0437, 0.4861, 0.2136, 0.5833]},
+    {"index": 3, "label": "중단우", "is_hero": false, "region": [0.7718, 0.4792, 0.9417, 0.5833]},
+    {"index": 4, "label": "하단좌", "is_hero": false, "region": [0.1456, 0.7014, 0.2961, 0.8125]},
+    {"index": 5, "label": "하단우", "is_hero": false, "region": [0.6699, 0.7014, 0.8252, 0.8125]},
+    {"index": 6, "label": "하단중앙 (나)", "is_hero": true, "region": [0.4078, 0.6944, 0.5922, 0.9722]}
   ],
-  "clockwise_order": [0, 1, 2, 3, 4, 5]
+  "clockwise_order": [0, 1, 3, 5, 6, 4, 2]
 }

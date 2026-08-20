@@ -44,7 +44,12 @@ DEFAULT_STREET = "프리플랍"
 # 오인하지 않게 한다. 뒤쪽은 \b를 쓰지 않는다 - "1000골드"처럼 숫자 뒤에 한글 단위가
 # 공백 없이 바로 붙는 경우(\d와 한글 모두 \w라 그 사이엔 \b가 성립하지 않는다) 금액을
 # 놓치기 때문이다(실측 OCR 결과로 확인).
-AMOUNT_PATTERN = re.compile(r"(?<!\w)(\d[\d,]*(?:\.\d+)?)(?:\s*(원|골드|칩|chip|point|pt))?", re.I)
+# 코인포커는 팟/스택이 크면 "4.95K"(=4,950), "1.2M"(=1,200,000)처럼 천/백만 단위
+# 축약 표기를 쓴다(실측 확인: 팟 표시 "4.89K" 등) - k/m 단위도 인식해서 실제 값으로
+# 환산한다(안 그러면 "4.95K"의 K가 그냥 버려져서 4.95로 1000배 작게 기록됨).
+AMOUNT_PATTERN = re.compile(r"(?<!\w)(\d[\d,]*(?:\.\d+)?)(?:\s*(원|골드|칩|chip|point|pt|k|m))?", re.I)
+
+_UNIT_MULTIPLIER = {"k": 1000, "m": 1_000_000}
 
 # "1만골드", "23만 4184골드"처럼 한글 만 단위로 표기된 금액. \d000 형태가 아니라서
 # AMOUNT_PATTERN만으로는 못 읽는다(실측 로그에서 베트/콜 금액의 상당수가 이 형태였음).
@@ -108,11 +113,22 @@ def _extract_amount(text: str) -> str:
         return str(man * 10000 + rest)
 
     matches = AMOUNT_PATTERN.findall(text)
-    numbers = [m[0] for m in matches if len(m[0].replace(",", "").replace(".", "")) >= 2]
-    if not numbers:
+    candidates = []  # (실제 값, 출력용 문자열)
+    for number_str, unit in matches:
+        digits = number_str.replace(",", "")
+        if len(digits.replace(".", "")) < 2:
+            continue
+        multiplier = _UNIT_MULTIPLIER.get(unit.lower()) if unit else None
+        value = float(digits) * multiplier if multiplier else float(digits)
+        if multiplier:
+            out = str(int(value)) if value == int(value) else str(value)
+        else:
+            out = number_str  # 단위 없으면 기존처럼 OCR 원문 그대로(콤마 포함) 유지
+        candidates.append((value, out))
+    if not candidates:
         return ""
-    # 여러 숫자가 섞여 있으면 가장 큰(자릿수가 많은) 숫자를 금액으로 추정한다.
-    return max(numbers, key=lambda n: len(n.replace(",", "")))
+    # 여러 숫자가 섞여 있으면(스택/베팅액 등) 실제 값이 가장 큰 것을 금액으로 추정한다.
+    return max(candidates, key=lambda c: c[0])[1]
 
 
 def parse_line(raw_text: str) -> ParsedAction:

@@ -69,20 +69,18 @@ from PIL import Image
 from . import dealer_chat_parser
 from .dealer_chat_parser import ChatRow, DealerChatLayout
 
-# 포지션이 안 읽힌 새 플레이어를 몇 프레임까지 기다렸다 포기할지(task.md [A]
-# "바로 다음 1~2프레임을 더 읽어서 보완"). 대기 중엔 그 행동을 아직 출력하지
-# 않는다 - 한 번 찍은 줄을 나중에 고쳐 찍을 수는 없으므로.
-POSITION_RETRY_FRAMES = 2
-
-# task.md "패널 리셋 오탐 수정" 1절: 프리플랍 컬럼이 "비었다"고 인정하려면
-# 1프레임이 아니라 이만큼 연속으로 비어야 한다(단발성 OCR 실패와 실제 패널
-# 리셋을 구분하기 위해서).
-PREFLOP_EMPTY_CONFIRM_STREAK = 2
-
-# task.md "기록 시작 동기화(깔끔한 진입)" 4절 "너무 오래 기다리면 실패 시": 동기화가
-# 이 폴링 횟수를 넘도록 끝나지 않으면 포기하고 지금 상태를 그대로 1게임으로 받아들여
-# 로컬 모드로 진행한다(프로그램이 멈추지 않게). 폴링 주기가 1.5초 안팎이니 대략 1분.
-SYNC_TIMEOUT_POLLS = 40
+# 아래 세 값(포지션 재시도/패널 리셋 확정/동기화 타임아웃)은 전부 "폴링 몇
+# 번"이 아니라 "실제로 몇 초 기다릴지"가 진짜 의도다 - 프레임 수로 박아두면
+# 폴링 주기(interval_sec)를 나중에 바꿀 때마다 실제 대기 시간이 같이 늘었다
+# 줄었다 해서 조용히 깨진다(실측 확인: interval_sec을 0.8->0.2로 낮췄더니
+# POSITION_RETRY_FRAMES=2가 주는 실제 여유가 1.6초->0.4초로 같이 줄어서, 포지션
+# 배지 OCR을 한 번만 놓쳐도 히어로 폴드 줄에 포지션이 안 붙는 회귀가 났다).
+# 그래서 목표를 "초" 단위로 정의해두고, __post_init__에서 실제 interval_sec에
+# 맞춰 프레임 수로 환산한다(아래 STREET_COUNTS 처럼 사용부는 여전히
+# self.position_retry_frames 등 프레임 수 정수를 쓴다).
+POSITION_RETRY_TARGET_SEC = 1.6  # 기존 POSITION_RETRY_FRAMES(2) * 기존 interval_sec(0.8) 기준
+PREFLOP_EMPTY_CONFIRM_TARGET_SEC = 1.6  # 기존 PREFLOP_EMPTY_CONFIRM_STREAK(2) * 0.8 기준
+SYNC_TIMEOUT_TARGET_SEC = 60.0  # task.md "기록 시작 동기화" 4절 목표치(대략 1분) 그대로
 
 HERO_LABEL = dealer_chat_parser.HERO_LABEL
 
@@ -154,6 +152,10 @@ class EmittedLine:
 class DealerChatRecorder:
     layout: DealerChatLayout = field(default_factory=dealer_chat_parser.load_layout)
     ocr_lang: str = "ko"
+    # 실제 폴링 주기(초) - POSITION_RETRY_TARGET_SEC 등 "초" 단위 목표를 프레임
+    # 수로 환산하는 데 쓴다(__post_init__). main.py/DealerChatBridge가 쓰는
+    # interval_sec과 같은 값을 넘겨줘야 한다.
+    interval_sec: float = 0.8
 
     hand_no: int = 0
     _started: bool = False
@@ -174,6 +176,14 @@ class DealerChatRecorder:
     syncing: bool = True
     sync_timed_out: bool = False  # 타임아웃으로 강제 종료됐는지(상태 문구용)
     _sync_polls: int = 0
+
+    def __post_init__(self) -> None:
+        # "초" 목표를 실제 interval_sec 기준 프레임 수로 환산(최소 1) - 폴링
+        # 주기가 바뀌어도 실제 대기/타임아웃 시간이 그대로 유지된다.
+        sec = self.interval_sec if self.interval_sec > 0 else 0.8
+        self.position_retry_frames = max(1, round(POSITION_RETRY_TARGET_SEC / sec))
+        self.preflop_empty_confirm_streak = max(1, round(PREFLOP_EMPTY_CONFIRM_TARGET_SEC / sec))
+        self.sync_timeout_polls = max(1, round(SYNC_TIMEOUT_TARGET_SEC / sec))
 
     def _row_key(self, row: ChatRow) -> tuple:
         # 이름은 정규화해서 키로 쓴다 - 말줄임표 붙은 이름은 폴링마다 OCR이 점(•)
@@ -255,8 +265,9 @@ class DealerChatRecorder:
             # 프리플랍 컬럼이 (내용이 있었다가) 비어 보이면, 패널이 리셋되는 중일
             # 수 있다는 신호로 기억해둔다 - 다시 채워지면 아래에서 새 핸드로 쓴다
             # (task.md "99%를 위한 안정화" 2절 "패널이 비워졌다가 다시 채워짐").
-            # 단, 딱 한 번 비었다고 바로 인정하지 않는다 - 연속 2폴링 이상이어야
-            # "확정된 빈 상태"로 센다(위 PREFLOP_EMPTY_CONFIRM_STREAK 참고).
+            # 단, 딱 한 번 비었다고 바로 인정하지 않는다 - 연속으로 일정 시간
+            # 이상이어야(self.preflop_empty_confirm_streak, __post_init__ 참고)
+            # "확정된 빈 상태"로 센다.
             if self._started and self._hand_preflop_keys:
                 self._preflop_empty_streak += 1
         else:
@@ -278,7 +289,7 @@ class DealerChatRecorder:
                 and (_norm_name(r.player), r.action, r.amount) not in self._hand_preflop_keys
                 for r in preflop_rows
             )
-            panel_refilled_after_empty = self._preflop_empty_streak >= PREFLOP_EMPTY_CONFIRM_STREAK
+            panel_refilled_after_empty = self._preflop_empty_streak >= self.preflop_empty_confirm_streak
             is_new_hand = (
                 not self._started
                 or new_ante_after_decision
@@ -315,7 +326,7 @@ class DealerChatRecorder:
                 if r.action == "Fold":
                     self._hand_folded_names.add(_norm_name(r.player))
 
-        if self.syncing and self._sync_polls >= SYNC_TIMEOUT_POLLS:
+        if self.syncing and self._sync_polls >= self.sync_timeout_polls:
             # task.md 4절 "실패 시": 동기화가 너무 오래 안 끝나면 포기하고 지금
             # 상태를 그대로 1게임으로 받아들여 로컬 모드로 진행한다(멈추지 않음).
             self._reset_hand_state()
@@ -379,7 +390,7 @@ class DealerChatRecorder:
                 if position == "?":
                     pending = self._pending.get(key)
                     if pending is None:
-                        self._pending[key] = _PendingRow(row=row, frames_left=POSITION_RETRY_FRAMES)
+                        self._pending[key] = _PendingRow(row=row, frames_left=self.position_retry_frames)
                         continue  # 처음 보는 미해결 항목 - 재시도 기회를 주고 이번엔 보류
                     pending.frames_left -= 1
                     if pending.frames_left > 0:

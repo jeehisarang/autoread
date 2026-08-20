@@ -222,6 +222,21 @@ def _within_edit_distance_one(a: str, b: str) -> bool:
     return True
 
 
+def _edit_distance_at_most(a: str, b: str, max_dist: int) -> bool:
+    """a, b의 편집거리가 max_dist 이하인지 (일반 DP, 닉네임 길이라 작아서 O(n*m)도 충분)."""
+    la, lb = len(a), len(b)
+    if abs(la - lb) > max_dist:
+        return False
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        curr = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+        prev = curr
+    return prev[lb] <= max_dist
+
+
 def names_match_prefix(hero_name: str, chat_name: str, min_len: int = 5) -> bool:
     """말줄임표로 짧게 잘린 닉네임끼리도 접두어로 매칭한다(task.md [D]).
     예: "M0mSp4gh…" <-> "M0mSp4ghetti1"(실측: OCR은 말줄임표를 "•••"로 읽는다 -
@@ -245,7 +260,18 @@ def names_match_prefix(hero_name: str, chat_name: str, min_len: int = 5) -> bool
         return shorter == longer
     if longer.startswith(shorter):
         return True
-    return abs(len(a) - len(b)) <= 1 and _within_edit_distance_one(a, b)
+    if abs(len(a) - len(b)) <= 1 and _within_edit_distance_one(a, b):
+        return True
+    # 실측 확인된 문제(2026-08-21): OCR이 스타일체 폰트에서 "ly" 같은 두 글자를
+    # 로마 숫자 기호(예: "ⅳ")처럼 낯선 유니코드 한 글자로 뭉개 읽고, 그 글자는
+    # _NON_ALNUM 필터에 걸려 통째로 사라진다 - 원래 이름보다 2글자 짧아지는
+    # 식으로 어긋난다. 이런 경우까지 잡으려고, 충분히 긴 이름(min_len*2 이상,
+    # 오매칭 위험이 낮음)에 한해 앞부분 편집거리 2까지 허용한다.
+    if len(shorter) >= min_len + 3:
+        window = longer[: len(shorter) + 2]
+        if _edit_distance_at_most(shorter, window, 2):
+            return True
+    return False
 
 
 # ---------- 컬럼/프레임 파싱 ----------

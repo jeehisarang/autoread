@@ -58,12 +58,21 @@ class App:
         self.chat_hwnd: int | None = None
         self.chat_title: str | None = self.cfg.get("chat_window_title")
         self.save_path: str | None = self.cfg.get("save_path")
-        self.interval_sec = float(self.cfg.get("interval_sec", 0.8))
+        # src/config.py DEFAULT_CONFIG와 같은 기본값(0.2)으로 맞춘다 - 예전엔 여기만
+        # 0.8로 어긋나 있었는데, 폴링 간격이 너무 길면(특히 폴드가 빠르게 연달아
+        # 일어나는 테이블에서) 딜러 채팅 창의 이전 폴링 행동 줄이 화면에서 완전히
+        # 스크롤돼 사라져 "겹치는 줄이 하나도 없음" -> 새 핸드로 오판하는 문제가
+        # 있었다(같은 핸드가 둘로 쪼개짐, 실측 확인: hand15/16이 홀카드까지 똑같은데
+        # 분리됨). AI 호출은 별도 스레드풀에 던지기만 해서(대기 없음) 이 값을 줄여도
+        # AI 지연과는 무관하다.
+        self.interval_sec = float(self.cfg.get("interval_sec", 0.2))
         self.ocr_lang = self.cfg.get("ocr_lang", "ko")
         # task.md "히어로 닉네임 설정값 매칭": 좌석 OCR로 매번 재탐지하는 대신
         # 사용자가 미리 넣어둔 닉네임으로 히어로를 식별한다. 비워두면 기존
         # 좌석 OCR 자동 인식으로 폴백된다(DealerChatBridge 쪽에서 처리).
         self.hero_nickname_var = tk.StringVar(value=self.cfg.get("hero_nickname", ""))
+        # task.md "히어로 닉네임 최근 목록 + 자동 저장": 최근 사용한 닉네임 최대 3개(최신순).
+        self.recent_hero_names: list[str] = list(self.cfg.get("recent_hero_names") or [])
 
         self.recorder: DealerChatBridge | None = None
         self.xlsx_logger: XlsxLogger | None = None
@@ -118,6 +127,15 @@ class App:
             row3, text="(비워두면 테이블 하단 좌석에서 자동 인식)", font=FONT_NORMAL, fg="#666",
         ).pack(side="left")
 
+        # task.md "히어로 닉네임 최근 목록 + 자동 저장": 최근 사용한 닉네임 최대 3개를
+        # 버튼으로 보여주고, 클릭하면 입력란에 바로 채워 넣는다.
+        row3b = tk.Frame(top)
+        row3b.pack(fill="x", pady=2)
+        tk.Label(row3b, text="최근 사용", font=FONT_NORMAL, width=18, anchor="w", fg="#666").pack(side="left")
+        self.recent_hero_frame = tk.Frame(row3b)
+        self.recent_hero_frame.pack(side="left", padx=10)
+        self._refresh_recent_hero_buttons()
+
         row4 = tk.Frame(top)
         row4.pack(fill="x", pady=10)
         self.btn_toggle = tk.Button(
@@ -156,6 +174,29 @@ class App:
                 "설정 > 시간 및 언어 > 언어 및 지역 에서 '한국어'를 추가하고,\n"
                 "언어 옵션에서 '광학 문자 인식(OCR)' 기능을 설치해주세요.",
             )
+
+    def _refresh_recent_hero_buttons(self):
+        """최근 닉네임 버튼 목록을 self.recent_hero_names 기준으로 다시 그린다."""
+        for child in self.recent_hero_frame.winfo_children():
+            child.destroy()
+        if not self.recent_hero_names:
+            tk.Label(self.recent_hero_frame, text="(없음)", font=FONT_NORMAL, fg="#999").pack(side="left")
+            return
+        for name in self.recent_hero_names[:3]:
+            tk.Button(
+                self.recent_hero_frame, text=name, font=FONT_NORMAL,
+                command=lambda n=name: self.hero_nickname_var.set(n),
+            ).pack(side="left", padx=3)
+
+    def _remember_hero_nickname(self, name: str):
+        """닉네임을 최근 목록 맨 앞으로 올린다(중복 제거, 최대 3개 유지). 빈 값은 무시."""
+        name = name.strip()
+        if not name:
+            return
+        if name in self.recent_hero_names:
+            self.recent_hero_names.remove(name)
+        self.recent_hero_names.insert(0, name)
+        self.recent_hero_names = self.recent_hero_names[:3]
 
     def _refresh_labels(self):
         self.lbl_table_window.config(text=f"테이블 창: {self.table_title or '없음 (히어로 매칭 생략됨)'}")
@@ -291,6 +332,8 @@ class App:
         self.root.after(0, lambda: self.lbl_status.config(text=f"상태: {text}"))
 
     def _save_config(self):
+        hero_nickname = self.hero_nickname_var.get().strip()
+        self._remember_hero_nickname(hero_nickname)
         self.cfg.update(
             {
                 "table_window_title": self.table_title,
@@ -298,10 +341,12 @@ class App:
                 "save_path": self.save_path,
                 "interval_sec": self.interval_sec,
                 "ocr_lang": self.ocr_lang,
-                "hero_nickname": self.hero_nickname_var.get().strip(),
+                "hero_nickname": hero_nickname,
+                "recent_hero_names": self.recent_hero_names,
             }
         )
         cfg_mod.save_config(self.cfg)
+        self._refresh_recent_hero_buttons()
 
     def on_close(self):
         if self.recorder and self.recorder.is_running():
