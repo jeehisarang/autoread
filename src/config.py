@@ -13,6 +13,7 @@ DEFAULT_CONFIG = {
     "ocr_lang": "ko",          # Windows OCR 언어 태그
     "hero_nickname": "",       # 마지막으로 입력한 히어로 닉네임 (task.md "최근 목록 + 자동 저장")
     "recent_hero_names": [],   # 최근 사용한 히어로 닉네임 최대 3개 (최신순)
+    "table_type": "7max",      # 테이블 인원수 선택 (task.md "6인/7인 선택 UI"), "6max" 또는 "7max"
 }
 
 

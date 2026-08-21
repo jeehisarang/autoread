@@ -26,7 +26,7 @@ import win32event
 import winerror
 
 from src import config as cfg_mod
-from src import ocr_engine, window_capture
+from src import ocr_engine, table_layout, window_capture
 from src.dealer_chat_bridge import DealerChatBridge
 from src.xlsx_writer import XlsxLogger
 
@@ -73,6 +73,9 @@ class App:
         self.hero_nickname_var = tk.StringVar(value=self.cfg.get("hero_nickname", ""))
         # task.md "히어로 닉네임 최근 목록 + 자동 저장": 최근 사용한 닉네임 최대 3개(최신순).
         self.recent_hero_names: list[str] = list(self.cfg.get("recent_hero_names") or [])
+        # task.md "테이블 인원수(6인/7인) 선택 UI": 좌표/파싱 로직은 그대로 두고,
+        # 기록 시작 전 선택한 값에 따라 table_layout(6max/7max) 파일만 바꿔 읽는다.
+        self.table_type_var = tk.StringVar(value=self.cfg.get("table_type", "7max"))
 
         self.recorder: DealerChatBridge | None = None
         self.xlsx_logger: XlsxLogger | None = None
@@ -135,6 +138,20 @@ class App:
         self.recent_hero_frame = tk.Frame(row3b)
         self.recent_hero_frame.pack(side="left", padx=10)
         self._refresh_recent_hero_buttons()
+
+        # task.md "테이블 인원수(6인/7인) 선택 UI": 기록 시작 전에만 바꿀 수 있다
+        # (start_recording에서 비활성화, stop_recording에서 다시 활성화).
+        row3c = tk.Frame(top)
+        row3c.pack(fill="x", pady=4)
+        tk.Label(row3c, text="테이블 인원수", font=FONT_BOLD, width=18, anchor="w").pack(side="left")
+        self.rad_6max = tk.Radiobutton(
+            row3c, text="6인 테이블", font=FONT_NORMAL, variable=self.table_type_var, value="6max",
+        )
+        self.rad_6max.pack(side="left", padx=(10, 0))
+        self.rad_7max = tk.Radiobutton(
+            row3c, text="7인 테이블", font=FONT_NORMAL, variable=self.table_type_var, value="7max",
+        )
+        self.rad_7max.pack(side="left", padx=(10, 0))
 
         row4 = tk.Frame(top)
         row4.pack(fill="x", pady=10)
@@ -296,6 +313,8 @@ class App:
         self.txt_log.delete("1.0", "end")
         self.txt_log.configure(state="disabled")
 
+        table_layout.set_active_table_type(self.table_type_var.get())
+
         self.recorder = DealerChatBridge(
             chat_hwnd=self.chat_hwnd,
             table_hwnd=self.table_hwnd,
@@ -305,15 +324,20 @@ class App:
             hero_nickname=self.hero_nickname_var.get().strip(),
             on_line=self._on_line,
             on_status=self.set_status,
+            on_hero_missing=self.on_hero_missing,
         )
         self.recorder.start()
         self.btn_toggle.config(text="■ 기록 정지", bg="#c62828")
+        self.rad_6max.config(state="disabled")
+        self.rad_7max.config(state="disabled")
         self._save_config()
 
     def stop_recording(self):
         if self.recorder:
             self.recorder.stop()
         self.btn_toggle.config(text="▶ 기록 시작", bg="#2e7d32")
+        self.rad_6max.config(state="normal")
+        self.rad_7max.config(state="normal")
         self.set_status("상태: 대기 중")
 
     # ---------- 콜백 (백그라운드 스레드에서 호출되므로 after로 UI 스레드에 전달) ----------
@@ -331,6 +355,20 @@ class App:
     def set_status(self, text: str):
         self.root.after(0, lambda: self.lbl_status.config(text=f"상태: {text}"))
 
+    def on_hero_missing(self):
+        # task.md "히어로 탈락 감지 및 기록 자동 중지": 백그라운드 스레드(bridge._run)
+        # 에서 호출되므로, 실제 정지 처리(버튼/라디오 상태 변경 포함)는 다른 콜백들과
+        # 같은 관례대로 after로 UI 스레드에 넘긴다. bridge가 이미 자기 폴링 루프는
+        # 스스로 멈췄지만(_stop_flag), UI 쪽 상태(버튼 텍스트, 인원수 선택 재활성화)는
+        # stop_recording()을 직접 불러야 갱신된다.
+        self.root.after(0, self._handle_hero_missing)
+
+    def _handle_hero_missing(self):
+        self.stop_recording()
+        # stop_recording()이 마지막에 "상태: 대기 중"으로 덮어쓰므로, 그 뒤에
+        # 경고 문구로 다시 덮어써서 최종적으로 사용자가 이 메시지를 보게 한다.
+        self.set_status("경고: 히어로가 테이블에서 보이지 않습니다. 기록을 중지합니다.")
+
     def _save_config(self):
         hero_nickname = self.hero_nickname_var.get().strip()
         self._remember_hero_nickname(hero_nickname)
@@ -343,6 +381,7 @@ class App:
                 "ocr_lang": self.ocr_lang,
                 "hero_nickname": hero_nickname,
                 "recent_hero_names": self.recent_hero_names,
+                "table_type": self.table_type_var.get(),
             }
         )
         cfg_mod.save_config(self.cfg)

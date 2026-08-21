@@ -15,6 +15,22 @@ from dataclasses import dataclass, field
 
 LAYOUT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "table_layout.json")
 
+# task.md "테이블 인원수(6인/7인) 선택 UI": 좌표는 그대로 두고, 어느 파일을 읽을지만
+# 선택값에 따라 바꾼다. 기본값(table_type 지정 없음)은 기존 동작과 동일하게
+# table_layout.json(LAYOUT_PATH)을 그대로 쓴다.
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TABLE_TYPE_PATHS = {
+    "6max": os.path.join(_BASE_DIR, "table_layout.6max.json"),
+    "7max": os.path.join(_BASE_DIR, "table_layout.7max.json"),
+}
+_active_path = LAYOUT_PATH
+
+
+def set_active_table_type(table_type: str) -> None:
+    """이후 load_layout() 호출이 읽을 파일을 6인/7인 레이아웃 파일로 전환한다."""
+    global _active_path
+    _active_path = TABLE_TYPE_PATHS.get(table_type, LAYOUT_PATH)
+
 # 실측 좌표 (2026-08-19 재실측, 코인포커 영상 'KakaoTalk_20260819_124403764.mp4'의
 # 35초 지점 프레임, 1030x720 캡처에서 잰 뒤 창 너비/높이 비율로 환산). table_layout.json
 # 이 없을 때 이 값으로 새로 만든다. ClubWPT GOLD 좌표는 table_layout.clubwpt.json 에 백업해뒀다.
@@ -122,16 +138,17 @@ def _to_layout(data: dict) -> TableLayout:
     )
 
 
-def _save_dict(data: dict) -> None:
-    with open(LAYOUT_PATH, "w", encoding="utf-8") as f:
+def _save_dict(data: dict, path: str = LAYOUT_PATH) -> None:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def load_layout() -> TableLayout:
-    """table_layout.json 을 읽는다. 없으면 task.md 샘플 좌표로 새로 만든다."""
-    if os.path.exists(LAYOUT_PATH):
+    """현재 선택된 레이아웃 파일(기본 table_layout.json, set_active_table_type()으로
+    전환 가능)을 읽는다. 없으면 task.md 샘플 좌표로 LAYOUT_PATH에 새로 만든다."""
+    if os.path.exists(_active_path):
         try:
-            with open(LAYOUT_PATH, "r", encoding="utf-8") as f:
+            with open(_active_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return _to_layout(data)
         except Exception:

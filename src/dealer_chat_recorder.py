@@ -4,17 +4,19 @@ dealer_chat_parser.py는 캡처 한 장을 받아 그 순간 보이는 내용을
 단발성 함수만 제공한다. 이 모듈은 그걸 실시간 폴링 루프에서 쓸 수 있게 감싸서:
 
   [A] 포지션 OCR 누락 보완 - 이번 핸드에서 그 플레이어 포지션을 이미 한 번이라도
-      읽은 적 있으면 즉시 재사용하고(포지션은 핸드 내내 안 바뀌므로), 처음 보는
-      플레이어인데 이번에 못 읽었으면 출력을 몇 프레임 미루면서 재시도한다.
+      읽은 적 있으면 즉시 재사용한다(포지션은 핸드 내내 안 바뀌므로).
       task.md "99%를 위한 안정화" 1절: 재사용 조회를 이름 완전일치에서 접두어
       매칭으로 넓혔다(hero 매칭에 쓰던 것과 같은 방식) - 말줄임표로 잘린 이름이
       폴링마다 조금씩 다르게 OCR돼도("G0r1ll4Glu3" vs "G0r1ll4Gl") 같은 사람으로
       보고 이미 배운 포지션을 재사용한다.
-        (실측 재확인: "긴 이름일수록 배지-이름 간격이 벌어져서 lookback을
-      벗어난다"는 가설로 접근했었는데, 실제로 다시 캡처해서 재보니 그게 아니었다 -
-      포지션 줄이 아예 존재하지 않는 프레임이 있었다(간격 문제가 아니라 그 프레임
-      자체에서 OCR이 배지 글자를 통째로 못 읽음). 그래서 이번엔 간격 튜닝 대신
-      "그래도 최대한 재사용해서 메꾸는" 방향으로 풀었다.)
+        task.md "액션 순서 뒤섞임 수정"(2026-08-21): 예전엔 재사용으로도 못 채운
+      포지션은 출력을 몇 프레임 미루면서 재시도했는데, 그 사이 다른 행이 먼저
+      나가면서 로그 순서가 실제 딜러 채팅 순서와 달라지는 문제가 있었다(실측
+      확인: 지연됐던 행이 한참 뒤 다른 올인 액션들 사이에 끼어서 출력됨). 이제는
+      재사용으로도 못 채우면 그 자리에서 바로 이름 접두어로 폴백해서 출력한다 -
+      정확도(포지션 배지를 한 프레임 놓쳐도 재시도로 건졌던 것)보다 순서 정확성을
+      우선한다. 어차피 포지션을 못 읽어도 줄 자체는 항상 남는다(이름 접두어 폴백,
+      아래 [E] 참고).
   [D] 새 핸드 / 스트리트 감지 - 아래 신호들을 종합해서 판단한다:
       1) 프리플랍 컬럼에서 "지금까지 이번 핸드에서 본 적 있는 줄"이 이번
          폴링에 하나도 안 보임(패널이 리셋되고 다음 핸드 안티가 새로 쌓임).
@@ -69,16 +71,11 @@ from PIL import Image
 from . import dealer_chat_parser
 from .dealer_chat_parser import ChatRow, DealerChatLayout
 
-# 아래 세 값(포지션 재시도/패널 리셋 확정/동기화 타임아웃)은 전부 "폴링 몇
-# 번"이 아니라 "실제로 몇 초 기다릴지"가 진짜 의도다 - 프레임 수로 박아두면
-# 폴링 주기(interval_sec)를 나중에 바꿀 때마다 실제 대기 시간이 같이 늘었다
-# 줄었다 해서 조용히 깨진다(실측 확인: interval_sec을 0.8->0.2로 낮췄더니
-# POSITION_RETRY_FRAMES=2가 주는 실제 여유가 1.6초->0.4초로 같이 줄어서, 포지션
-# 배지 OCR을 한 번만 놓쳐도 히어로 폴드 줄에 포지션이 안 붙는 회귀가 났다).
+# 아래 값(패널 리셋 확정/동기화 타임아웃)은 전부 "폴링 몇 번"이 아니라 "실제로
+# 몇 초 기다릴지"가 진짜 의도다 - 프레임 수로 박아두면 폴링 주기(interval_sec)를
+# 나중에 바꿀 때마다 실제 대기 시간이 같이 늘었다 줄었다 해서 조용히 깨진다.
 # 그래서 목표를 "초" 단위로 정의해두고, __post_init__에서 실제 interval_sec에
-# 맞춰 프레임 수로 환산한다(아래 STREET_COUNTS 처럼 사용부는 여전히
-# self.position_retry_frames 등 프레임 수 정수를 쓴다).
-POSITION_RETRY_TARGET_SEC = 1.6  # 기존 POSITION_RETRY_FRAMES(2) * 기존 interval_sec(0.8) 기준
+# 맞춰 프레임 수로 환산한다.
 PREFLOP_EMPTY_CONFIRM_TARGET_SEC = 1.6  # 기존 PREFLOP_EMPTY_CONFIRM_STREAK(2) * 0.8 기준
 SYNC_TIMEOUT_TARGET_SEC = 60.0  # task.md "기록 시작 동기화" 4절 목표치(대략 1분) 그대로
 
@@ -132,12 +129,6 @@ def _display_name_prefix(name: str, length: int = NAME_PREFIX_DISPLAY_LEN) -> st
 
 
 @dataclass
-class _PendingRow:
-    row: ChatRow
-    frames_left: int
-
-
-@dataclass
 class EmittedLine:
     """process_frame이 이번 폴링에서 새로 확정한 한 줄. text/tag는 콘솔·로그창
     출력용, row는 엑셀 등 구조화된 저장이 필요할 때 쓴다(hand_header/street_header
@@ -152,8 +143,8 @@ class EmittedLine:
 class DealerChatRecorder:
     layout: DealerChatLayout = field(default_factory=dealer_chat_parser.load_layout)
     ocr_lang: str = "ko"
-    # 실제 폴링 주기(초) - POSITION_RETRY_TARGET_SEC 등 "초" 단위 목표를 프레임
-    # 수로 환산하는 데 쓴다(__post_init__). main.py/DealerChatBridge가 쓰는
+    # 실제 폴링 주기(초) - PREFLOP_EMPTY_CONFIRM_TARGET_SEC 등 "초" 단위 목표를
+    # 프레임 수로 환산하는 데 쓴다(__post_init__). main.py/DealerChatBridge가 쓰는
     # interval_sec과 같은 값을 넘겨줘야 한다.
     interval_sec: float = 0.8
 
@@ -166,9 +157,17 @@ class DealerChatRecorder:
     _preflop_empty_streak: int = 0  # 프리플랍 컬럼이 내용 있다가 연속으로 비어 보인 폴링 횟수
     _emitted_keys: set = field(default_factory=set)  # (street, norm(name), action, amount)
     _emitted_position_keys: set = field(default_factory=set)  # (street, position, action, amount)
-    _pending: dict = field(default_factory=dict)  # key -> _PendingRow
     _street_started: set = field(default_factory=set)  # 이번 핸드에 헤더 찍은 스트리트
     _hero_folded_this_hand: bool = False
+
+    # task.md "히어로 탈락 감지 및 기록 자동 중지": 이번 핸드에서 히어로 닉네임과
+    # 매칭되는 행(안티 포함, ChatRow.is_hero)을 한 번이라도 봤는지. 새 핸드가
+    # 시작될 때(_begin_new_hand) 직전 핸드 기준으로 확인한 뒤 리셋한다.
+    _hero_seen_this_hand: bool = False
+    # 히어로가 연속으로 몇 핸드째 전혀 안 보이는지. 정상적으로 한 번이라도
+    # 보이면 0으로 리셋된다 - dealer_chat_bridge.py가 이 값을 보고 일정 횟수
+    # 이상이면 탈락으로 판단해 경고 + 기록 중지를 트리거한다.
+    hero_missing_streak: int = 0
 
     # task.md "기록 시작 동기화(깔끔한 진입)": 기록을 막 시작해서 화면에 이미 진행
     # 중이던 핸드 조각이 보이는 동안엔 True. 이 상태에선 일반 행동 로그를 출력하지
@@ -181,7 +180,6 @@ class DealerChatRecorder:
         # "초" 목표를 실제 interval_sec 기준 프레임 수로 환산(최소 1) - 폴링
         # 주기가 바뀌어도 실제 대기/타임아웃 시간이 그대로 유지된다.
         sec = self.interval_sec if self.interval_sec > 0 else 0.8
-        self.position_retry_frames = max(1, round(POSITION_RETRY_TARGET_SEC / sec))
         self.preflop_empty_confirm_streak = max(1, round(PREFLOP_EMPTY_CONFIRM_TARGET_SEC / sec))
         self.sync_timeout_polls = max(1, round(SYNC_TIMEOUT_TARGET_SEC / sec))
 
@@ -235,11 +233,21 @@ class DealerChatRecorder:
         self._hand_preflop_keys = set()
         self._emitted_keys = set()
         self._emitted_position_keys = set()
-        self._pending = {}
         self._street_started = set()
         self._hero_folded_this_hand = False
+        self._hero_seen_this_hand = False
 
-    def _begin_new_hand(self) -> str:
+    def _begin_new_hand(self, hero_name: str = "") -> str:
+        # task.md "히어로 탈락 감지 및 기록 자동 중지": 방금 끝난 핸드 기준으로
+        # 연속 미등장 횟수를 갱신한다 - _reset_hand_state가 _hero_seen_this_hand를
+        # 다시 False로 비우기 전에 확인해야 한다. 관전 모드처럼 히어로 닉네임
+        # 자체가 없는 세션(hero_name이 빈 문자열)에서는 판단 대상이 아니므로
+        # 건드리지 않는다(dealer_chat_bridge.py도 이 경우 스트릭을 안 본다).
+        if hero_name:
+            if self._hero_seen_this_hand:
+                self.hero_missing_streak = 0
+            else:
+                self.hero_missing_streak += 1
         # task.md "로그 안정화 4종" 4절 A안: 인원수 표기가 실측으로 계속
         # 뒤죽박죽인 게 확인돼서 아예 없앴다("[N게임 시작]"만 남김).
         self.hand_no += 1
@@ -316,7 +324,7 @@ class DealerChatRecorder:
                         ))
                         self.syncing = False
                 else:
-                    out.append(EmittedLine(text=self._begin_new_hand(), tag="hand_header", hand_no=self.hand_no))
+                    out.append(EmittedLine(text=self._begin_new_hand(hero_name), tag="hand_header", hand_no=self.hand_no))
                     self._started = True
             self._preflop_empty_streak = 0  # 내용이 다시 보였으니 스트릭은 항상 리셋
             self._hand_preflop_keys |= current_keys
@@ -342,17 +350,22 @@ class DealerChatRecorder:
         if self._hero_folded_this_hand:
             return out  # task.md [E]: 히어로 폴드 후 이 핸드는 기록 중단
 
+        # task.md "히어로 탈락 감지 및 기록 자동 중지": 히어로 닉네임과 매칭되는
+        # 행이 이번 폴링에 하나라도 있으면(안티 포함 - 자리에 앉아있다는 증거로는
+        # 충분함), 지금(이 폴링에서 새 핸드 판정이 이미 끝난 뒤) 확정된 핸드
+        # 기준으로 "히어로가 보였다"로 표시해둔다. 위쪽(새 핸드 판정) 이후에 둬야
+        # 한다 - 그렇지 않으면 새 핸드가 시작되는 바로 그 폴링에 히어로 행까지
+        # 같이 보이는 경우, _begin_new_hand가 리셋하기 전에 세운 표시가 "이전"
+        # 핸드 판정에 쓰이고 새로 시작되는 핸드엔 반영이 안 되는 순서 문제가 있었다.
+        if hero_name and any(r.is_hero for rows in parsed.values() for r in rows):
+            self._hero_seen_this_hand = True
+
         for street in self.layout.streets:
             street_rows = parsed.get(street) or []
             # task.md "스트리트 헤더 누락 수정": 헤더는 "이 컬럼에 뭔가 처음
-            # 등장했는지"만 보고 찍는다 - 그 행이 포지션 재시도 대기열에 걸려서
-            # 이번 폴링엔 아직 못 내보내더라도(아래 루프의 pending 로직) 헤더 자체는
-            # 이미 찍는다. 예전엔 헤더 출력이 "그 행을 실제로 내보내는 시점"에
-            # 같이 걸려 있었는데, 실측 확인된 문제: 이 테이블처럼 한 핸드가 몇 초
-            # 안에 프리플랍→플랍→턴→리버까지 다 지나가버리면, 플랍/턴의 유일한
-            # 행이 딱 1번만 보이고 포지션이 안 잡혀서 재시도 대기로 들어갔다가,
-            # 재시도 기회를 다 쓰기도 전에 다음 핸드가 시작돼 버려서(_pending이
-            # 통째로 초기화됨) 그 행도, 헤더도 영영 안 찍히는 경우가 있었다.
+            # 등장했는지"만 보고 찍는다 - 그 행을 실제로 내보내는 시점과 분리해둔다
+            # (지금은 포지션을 못 읽어도 바로 내보내므로 사실상 같은 폴링에 같이
+            # 찍히지만, 분리해두는 편이 안전하다).
             if street_rows and street not in self._street_started:
                 out.append(EmittedLine(text=f"[{street}]", tag="street_header", hand_no=self.hand_no))
                 self._street_started.add(street)
@@ -384,22 +397,14 @@ class DealerChatRecorder:
                     pos_key = (street, position, row.action, row.amount)
                     if pos_key in self._emitted_position_keys:
                         self._emitted_keys.add(key)
-                        self._pending.pop(key, None)
                         continue
 
-                if position == "?":
-                    pending = self._pending.get(key)
-                    if pending is None:
-                        self._pending[key] = _PendingRow(row=row, frames_left=self.position_retry_frames)
-                        continue  # 처음 보는 미해결 항목 - 재시도 기회를 주고 이번엔 보류
-                    pending.frames_left -= 1
-                    if pending.frames_left > 0:
-                        continue  # 계속 대기
-                    del self._pending[key]  # 재시도 끝 - 포기하고 "?"로 출력
-                else:
-                    self._pending.pop(key, None)
-
-                row.position = position  # 재사용/재시도로 뒤늦게 확정된 값을 반영
+                # task.md "액션 순서 뒤섞임 수정": 포지션을 이번에도(재사용으로도)
+                # 못 채웠다고 출력을 미루지 않는다 - 예전엔 몇 프레임 재시도
+                # 대기열에 넣고 기다렸는데, 그 사이 다른 행이 먼저 나가면서 로그
+                # 순서가 실제 딜러 채팅 순서와 달라졌다(실측 확인). 이제는 바로
+                # 이름 접두어 폴백으로 이번 폴링에 출력한다(_format_action이 처리).
+                row.position = position
                 out.append(EmittedLine(
                     text=self._format_action(row, position),
                     tag="hero_action" if row.is_hero else "action",
