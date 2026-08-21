@@ -47,13 +47,38 @@ DEFAULT_STREET = "프리플랍"
 # 코인포커는 팟/스택이 크면 "4.95K"(=4,950), "1.2M"(=1,200,000)처럼 천/백만 단위
 # 축약 표기를 쓴다(실측 확인: 팟 표시 "4.89K" 등) - k/m 단위도 인식해서 실제 값으로
 # 환산한다(안 그러면 "4.95K"의 K가 그냥 버려져서 4.95로 1000배 작게 기록됨).
-AMOUNT_PATTERN = re.compile(r"(?<!\w)(\d[\d,]*(?:\.\d+)?)(?:\s*(원|골드|칩|chip|point|pt|k|m))?", re.I)
+# task.md "L 단위 처리"(2026-08-21): 일부 테이블(6인, 짧은 스택 프리롤 등)은 "L"이라는
+# 또 다른 단위도 쓴다(실측 확인: "22.44L", "2L" 등 - 확대해서 직접 봤을 때 M자와는
+# 분명히 다른 글자였다). k/m은 배율을 확실히 알아서(1000/1,000,000) 실제 값으로
+# 환산하지만, l은 정확한 배율이 아직 확인 안 됐다 - 잘못된 배율을 곱해서 그럴듯하지만
+# 틀린 숫자를 보여주느니, 단위를 그대로 남겨서("22.44L") 값 자체는 안 잃게 한다.
+AMOUNT_PATTERN = re.compile(r"(?<!\w)(\d[\d,]*(?:\.\d+)?)(?:\s*(원|골드|칩|chip|point|pt|k|m|l))?", re.I)
 
 _UNIT_MULTIPLIER = {"k": 1000, "m": 1_000_000}
+# 배율은 모르지만 "숫자만 스치듯 인식된 노이즈"는 아니라고 확실히 알 수 있는 단위.
+# _extract_amount에서 두 가지 용도로 쓴다: (1) 아래 "2자리 미만은 노이즈로 버림"
+# 필터를 이 단위가 붙어있으면 건너뛴다(단위가 붙어있으면 그 자체로 진짜 금액이라는
+# 뜻이므로 "2L"처럼 짧아도 버리면 안 된다), (2) 출력에 단위를 그대로 남긴다.
+_UNRESOLVED_UNITS = {"l"}
 
 # "1만골드", "23만 4184골드"처럼 한글 만 단위로 표기된 금액. \d000 형태가 아니라서
 # AMOUNT_PATTERN만으로는 못 읽는다(실측 로그에서 베트/콜 금액의 상당수가 이 형태였음).
 KOREAN_MAN_PATTERN = re.compile(r"(?<!\w)(\d[\d,]*)\s*만(?:\s*(\d[\d,]*))?", re.I)
+
+# 실측 확인(2026-08-21, 5개 영상 교차 검증): 이 테이블 폰트에서 숫자 뒤에 바로
+# 붙는 두 자리 "0"이 종종 한글 "예"로 오인식되고("500"→"5예", "400"→"4예",
+# "800"→"8예"), 소수점/공백 뒤 "1"이 대문자 "I"로 오인식된다("2.1K"→"2.IK",
+# "1K"→"IK") - 실제 딜러 채팅 프레임을 확대해서 직접 대조함(이 폰트에서 "1"이
+# 세로획만 있어 "I"와 거의 구분이 안 됨). 이미 행동 패턴이 매칭된 좁은 한 줄
+# 문맥에서만 쓰이므로(전체 문장이 아님) 다른 텍스트를 오염시킬 위험이 적다.
+_OCR_ZERO_AS_YE = re.compile(r"(?<=\d)예")
+_OCR_ONE_AS_I = re.compile(r"\bI(?=K(?:[^a-zA-Z]|$))")
+
+
+def _fix_ocr_amount_glyphs(text: str) -> str:
+    text = _OCR_ZERO_AS_YE.sub("00", text)
+    text = _OCR_ONE_AS_I.sub("1", text)
+    return text
 
 # 금액이 의미가 없는 행동 유형 (있어도 무시한다)
 ACTIONS_WITHOUT_AMOUNT = {"Fold", "Check"}
@@ -106,6 +131,7 @@ def _extract_player(text: str, action_span_start: int) -> str:
 
 
 def _extract_amount(text: str) -> str:
+    text = _fix_ocr_amount_glyphs(text)
     man_match = KOREAN_MAN_PATTERN.search(text)
     if man_match:
         man = int(man_match.group(1).replace(",", ""))
@@ -116,12 +142,19 @@ def _extract_amount(text: str) -> str:
     candidates = []  # (실제 값, 출력용 문자열)
     for number_str, unit in matches:
         digits = number_str.replace(",", "")
-        if len(digits.replace(".", "")) < 2:
+        unit_lower = unit.lower() if unit else ""
+        has_known_unit = unit_lower in _UNIT_MULTIPLIER or unit_lower in _UNRESOLVED_UNITS
+        # 단위가 붙어있으면(k/m/l 등) 그 자체로 진짜 금액이라는 확실한 신호이므로,
+        # 자릿수가 짧아도(예: "2L") 노이즈로 버리지 않는다. 단위가 아예 없는 맨숫자만
+        # 기존처럼 2자리 미만이면 버린다(우연히 섞인 잡음 숫자 오인 방지).
+        if len(digits.replace(".", "")) < 2 and not has_known_unit:
             continue
-        multiplier = _UNIT_MULTIPLIER.get(unit.lower()) if unit else None
+        multiplier = _UNIT_MULTIPLIER.get(unit_lower)
         value = float(digits) * multiplier if multiplier else float(digits)
         if multiplier:
             out = str(int(value)) if value == int(value) else str(value)
+        elif unit_lower in _UNRESOLVED_UNITS:
+            out = f"{number_str}{unit.upper()}"  # 배율 모르니 원래 단위 그대로 보존
         else:
             out = number_str  # 단위 없으면 기존처럼 OCR 원문 그대로(콤마 포함) 유지
         candidates.append((value, out))

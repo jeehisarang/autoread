@@ -14,14 +14,32 @@ XlsxLogger 연동)로 감싸서, main.py 쪽 변경을 최소화한다.
     실제 플레이든 자리는 같다. 매칭 성공 여부와 무관하게 항상 시도한다).
   - 히어로 홀카드 인식 (AI 비전, 핸드당 2장이 인식되거나 히어로가 폴드하거나
     시도 횟수를 다 쓸 때까지 재시도 - task.md "히어로 홀카드 인식 복구").
-  - 보드 카드 인식 (AI 비전, 플랍/턴/리버 전환마다 최대 1회. 로컬 픽셀 판별
+  - 보드 카드 인식 (AI 비전, 플랍/턴/리버 전환마다 최대 2회(기대 장수와 다르면
+    한 번 재시도) - task.md "보드 카드 인식 개선"(2026-08-21). 로컬 픽셀 판별
     (board_reader)은 AI 프롬프트용 힌트/즉시 표시용 폴백으로 쓰고, 최종 "N장"은
-    AI가 실제로 읽은 카드 개수를 그대로 쓴다 - task.md "로그 안정화 4종" 3절).
+    AI가 실제로 읽은 카드 개수를 그대로 쓴다 - task.md "로그 안정화 4종" 3절.
+    이미 확정된 카드는 다음 스트리트부터 고정값으로 AI에게 넘기고 새로 추가된
+    카드만 읽게 해서, 같은 카드가 스트리트마다 다른 무늬로 흔들리는 문제를
+    없앤다(card_reader.read_board_cards의 known_cards).
 
 task.md "99%를 위한 안정화" 3절: AI 호출(홀카드/보드)은 전부 스레드풀에 맡기고
 메인 폴링 루프는 기다리지 않는다 - 딜러 채팅 OCR/파싱/새핸드감지(글자 기록의
-핵심)는 AI 응답 속도와 완전히 무관하게 계속 진행된다. AI 결과는 준비되는 대로
-콜백에서 뒤이어 한 줄 더 찍힌다(카드 값은 늦게 채워져도 된다는 게 지시서 전제).
+핵심)는 AI 응답 속도와 완전히 무관하게 계속 진행된다(내부 상태는 항상 실시간).
+
+task.md "출력 두 영역 분리"(2026-08-21): "딜러 채팅 순서 충실"을 위해 한때
+카드 요청이 응답을 기다리는 동안 그 뒤 행동 줄을 큐에 쌓아뒀다가 한꺼번에
+내보내는 방식을 썼는데(_pending_card_reads/_held_outputs), AI 워커가 2개뿐이라
+짧은 핸드가 연달아 나오는 세션에서는 홀카드 요청이 쌓이면서 대기가 길게
+누적됐다(실측 확인: "행동이 거의 안 찍힌다" - 실제로는 유실이 아니라 메모리에
+갇혀 안 보이는 것이었지만, 사용자 입장에선 기록이 안 되는 것처럼 보였고, 정지
+전에 프로그램이 죽기라도 하면 진짜로 유실될 위험도 있었다). 그래서 큐 방식을
+걷어내고, 아예 두 개의 독립된 출력 채널로 분리했다:
+  - on_line(메인 기록): [N게임 시작]/[스트리트] 헤더(로컬 픽셀 장수까지만,
+    AI 무관)/행동 줄. 전부 AI와 완전히 무관하게 항상 즉시 나간다 - 절대
+    기다리지 않는다.
+  - on_card_line(카드 상세): "내 홀카드: ...", "[스트리트] 보드 확인: N장
+    (실제값)". AI 결과가 준비되는 대로 나가고, 늦어도 되고, 메인 기록 순서에
+    전혀 영향을 주지 않는다(애초에 같은 스트림에 안 섞이므로).
 """
 import threading
 import time
@@ -70,6 +88,22 @@ BOARD_RECHECK_INTERVAL_SEC = 0.05
 # 오판하고, 너무 크면 탈락 후 불필요한 AI 호출이 오래 지속된다.
 HERO_MISSING_HAND_THRESHOLD = 4
 
+# task.md "보드 장수 디바운스": 로컬 보드 장수 상승(3→4, 4→5)도 핸드 쪼개짐
+# 수정 때 쓴 것과 같은 패턴으로 한 번의 오측정만으로 바로 확정하지 않는다(실측
+# 확인: 카드 폭 자동 보정이 딱 하나의 측정값에 정확히 맞춰지다 보니, 아주 작은
+# 측정 흔들림에도 다음 등급으로 잘못 튀어 올라가는 경우가 있었다 - 실제로는
+# 플랍 3장 그대로인데 "[턴] 보드: 4장"이 찍힘). 연속 몇 번 폴링 이상 같은(또는
+# 더 높은) 값이 나와야만 확정한다. 리버 놓침 방지용 재확인(_recheck_board_count_burst)
+# 은 이미 자체적으로 여러 번 다시 캡처해서 확인하므로 이 디바운스와 별개로 그대로
+# 즉시 반영한다(이중으로 느려지지 않게).
+BOARD_COUNT_CONFIRM_STREAK = 2
+
+# task.md "보드 카드 인식 개선": AI가 읽은 카드 개수가 기대 장수(힌트)와 다르면
+# 한 번 더 재시도한다(실측 확인: 로컬 픽셀/힌트는 3장이 맞는데 AI가 2장만 읽는
+# 경우가 있었음). 무한 재시도는 안 하고 딱 한 번만 - 그래도 안 맞으면 그 결과를
+# 그대로 받아들인다(task.md "로그 안정화 4종" 3절: 억지로 맞추지 않음).
+MAX_BOARD_ATTEMPTS = 2
+
 
 class DealerChatBridge:
     def __init__(
@@ -80,7 +114,8 @@ class DealerChatBridge:
         interval_sec: float = 1.5,
         ocr_lang: str = "ko",
         hero_nickname: str = "",  # 설정값 - 비어있으면 좌석 OCR 자동 인식으로 폴백
-        on_line=None,  # callback(text:str, tag:str)
+        on_line=None,  # callback(text:str, tag:str) - 메인 기록(딜러 채팅 순서 그대로)
+        on_card_line=None,  # callback(text:str, tag:str) - 카드 상세(AI 결과, 늦어도 됨)
         on_status=None,  # callback(status_text:str)
         on_hero_missing=None,  # callback() - task.md "히어로 탈락 감지 및 기록 자동 중지"
     ):
@@ -90,6 +125,7 @@ class DealerChatBridge:
         self.interval_sec = interval_sec
         self.ocr_lang = ocr_lang
         self.on_line = on_line
+        self.on_card_line = on_card_line
         self.on_status = on_status
         self.on_hero_missing = on_hero_missing
 
@@ -110,10 +146,16 @@ class DealerChatBridge:
         # 몰려도 순차 처리되면서 메인 루프는 안 막힘).
         self._ai_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dealer-chat-ai")
 
-        # AI 보드 카드 인식은 스트리트당 한 번만 "제출"한다(성공/실패 무관, 다시
-        # 시도하지 않는다 - task.md "과도한 호출 금지"). hand_no는 계속 증가만
-        # 하므로 리셋 없이 멤버십만 확인해도 된다.
-        self._board_attempted: set = set()  # {(hand_no, street), ...}
+        # AI 보드 카드 인식은 스트리트당 MAX_BOARD_ATTEMPTS번까지만 "제출"한다
+        # (task.md "보드 카드 인식 개선" - 기대 장수와 다르면 한 번 재시도, 그
+        # 이상은 과도한 호출이라 안 함 - task.md "과도한 호출 금지"). hand_no는
+        # 계속 증가만 하므로 리셋 없이 멤버십만 확인해도 된다.
+        self._board_attempts: dict = {}  # (hand_no, street) -> 시도 횟수
+
+        # task.md "보드 카드 재확인 흔들림 수정": 이 핸드에서 이미 확정된(기대
+        # 장수와 정확히 일치한) 보드 카드 목록 - 다음 스트리트부터 AI에게 고정값
+        # 으로 넘겨서 새로 추가된 카드만 읽게 한다(card_reader.read_board_cards).
+        self._confirmed_board_cards: dict = {}  # hand_no -> [card_str, ...]
 
         # task.md "히어로 홀카드 인식 복구": 홀카드는 2장이 다 인식되거나(성공)
         # 시도 횟수를 다 쓸 때까지(포기) 재시도하므로, 보드와 달리 "이미 끝난 핸드"
@@ -128,6 +170,10 @@ class DealerChatBridge:
         self._cur_hand_no: int = 0
         self._cur_hand_board_count: int = 0
         self._cur_hand_headers: set = set()
+        # task.md "보드 장수 디바운스": 아직 확정 안 된 "후보" 장수와, 그 후보가
+        # 연속으로 몇 번째 관측됐는지. 새 핸드가 시작되면(위 셋과 함께) 비운다.
+        self._board_count_candidate: int = 0
+        self._board_count_candidate_streak: int = 0
 
         # task4.md "히어로 폴드 시 보드 확인도 함께 중단": 히어로가 폴드로 확정된
         # hand_no를 여기 모아둔다. 새 핸드는 매번 새 hand_no를 받으므로(증가만
@@ -139,13 +185,37 @@ class DealerChatBridge:
         # 딱 한 번만 트리거한다(반복 호출/중복 정지 방지).
         self._hero_missing_stop_triggered = False
 
+        # task.md "참가인원(추정) 표시": recorder.last_participant_hand_no가
+        # 갱신될 때마다 한 번씩만 내보내기 위한 already-emitted 집합.
+        self._participant_count_emitted_for: set = set()
+
+        # task.md "보드 장수 감지 수정": 카드 1장의 실제 가로 폭(px)은 테이블/방
+        # 마다 렌더링 크기가 달라서 board_reader.py의 고정 상수 하나로는 안 맞는
+        # 경우가 있다(실측 확인: 어떤 6인 테이블은 리버 5장이 계속 4장으로만
+        # 잡힘). AI가 실제로 읽어낸 카드 개수(신뢰할 수 있는 정답)로 이 세션의
+        # 실제 카드 폭을 역산해서 학습해둔다(_on_board_cards_done) - 학습되기
+        # 전(세션 시작 직후 등)에는 None이라 board_reader의 기본값을 그대로 쓴다.
+        # 한 세션(한 번의 기록 시작~정지) 내내 유지한다 - 테이블 스킨은 세션
+        # 도중 안 바뀌므로 핸드마다 리셋할 필요가 없다.
+        self._board_card_unit_width: float | None = None
+
     def start(self) -> None:
         self._stop_flag.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
+        # task.md "정지 시 UI 멈춤 수정": thread.join()을 호출한 스레드(보통
+        # Tkinter 메인 스레드, main.py의 정지 버튼 클릭 콜백)에서 그대로 블로킹
+        # 하면, 폴링 스레드가 마침 캡처/재시도 중일 때 그 스레드가 끝날 때까지
+        # 최대 5초간 화면 전체가 "응답 없음" 상태가 된다(실측 확인). _stop_flag를
+        # 세우는 순간 폴링 스레드는 다음 반복에서 곧 알아서 멈추므로, join과
+        # executor 종료는 별도의 정리 스레드에 맡기고 이 메서드 자체는 즉시
+        # 반환한다 - 호출자는 곧바로 UI를 갱신해도 안전하다.
         self._stop_flag.set()
+        threading.Thread(target=self._cleanup_after_stop, daemon=True).start()
+
+    def _cleanup_after_stop(self) -> None:
         if self._thread is not None:
             self._thread.join(timeout=5)
         # 이미 시작된 AI 호출은 그냥 끝까지 두고(취소하면 카드 결과를 영영 못
@@ -163,10 +233,13 @@ class DealerChatBridge:
             except Exception:
                 pass
 
-    def _emit_line(self, text: str, tag: str) -> None:
+    def _emit_line(self, text: str, tag: str, hand_no: int = 0, street: str = "") -> None:
+        # task.md "표(그리드) 통합 UI": hand_no/street를 같이 넘겨서, 화면 쪽이
+        # 이 줄을 그 게임/스트리트의 행으로 정확히 배치할 수 있게 한다(카드 상세
+        # 결과가 나중에 같은 행에 채워지려면 어느 행인지부터 알아야 한다).
         if self.on_line:
             try:
-                self.on_line(text, tag)
+                self.on_line(text, tag, hand_no, street)
             except Exception:
                 pass
 
@@ -176,6 +249,22 @@ class DealerChatBridge:
                 self.on_hero_missing()
             except Exception:
                 pass
+
+    def _emit_card_line(self, text: str, tag: str, hand_no: int = 0, street: str = "") -> None:
+        """task.md "출력 두 영역 분리": 카드 상세(AI 결과) 전용 채널 - 메인
+        기록(on_line)과 완전히 분리돼 있어서, 늦게 나가도 메인 기록 순서에
+        영향을 주지 않는다. hand_no/street는 이 결과가 메인 기록의 어느 행
+        (hand_header면 hand_no만, street_header면 hand_no+street)에 속하는지
+        화면 쪽이 찾아서 그 행에 채워 넣을 수 있게 해준다(task.md "표 통합 UI").
+        on_card_line이 없으면(main.py가 아직 안 붙였으면) 메인 채널로라도
+        나가게 폴백한다."""
+        if self.on_card_line:
+            try:
+                self.on_card_line(text, tag, hand_no, street)
+            except Exception:
+                pass
+        else:
+            self._emit_line(text, tag, hand_no, street)
 
     def _log_card_row(self, hand_no: int, street: str, label: str, cards: str) -> None:
         """홀카드/보드 카드도 기존 엑셀 컬럼 구조 그대로에 얹는다(새 컬럼 추가 안 함 -
@@ -269,8 +358,11 @@ class DealerChatBridge:
         self._hole_cards_resolved_hands.add(hand_no)
         # 관전 모드라 안 보이거나 끝내 다 못 읽으면 card_reader가 빈 문자열/부분
         # 결과를 반환하고, 그대로 "(미확인)"으로 표시한다(에러 아님 - task.md 3절).
-        self._emit_line(f"내 홀카드: {cards or '(미확인)'}", "hand_header")
-        self._log_card_row(hand_no, self._recorder.layout.streets[0], "홀카드", cards)
+        # task.md "출력 두 영역 분리": 카드 상세 채널로만 나간다 - 메인 기록엔
+        # 영향 없음(늦게 나가도 됨).
+        preflop_street = self._recorder.layout.streets[0]
+        self._emit_card_line(f"내 홀카드: {cards or '(미확인)'}", "hand_header", hand_no, preflop_street)
+        self._log_card_row(hand_no, preflop_street, "홀카드", cards)
 
     # ---------- 보드 카드 (비동기) ----------
     def _street_header_text(self, table_img, street: str) -> str:
@@ -290,7 +382,9 @@ class DealerChatBridge:
         table_layout = load_table_layout()
         board_region_px = resolve_ratio_region(table_layout.board_region, table_img.size)
         try:
-            return board_reader.detect_card_count(table_img, board_region_px)
+            # task.md "보드 장수 감지 수정": 이 세션에서 학습된 카드 폭이 있으면
+            # 그걸로 판별한다(없으면 board_reader의 기본 상수로 자동 폴백).
+            return board_reader.detect_card_count(table_img, board_region_px, self._board_card_unit_width)
         except Exception:
             return 0
 
@@ -318,7 +412,7 @@ class DealerChatBridge:
         for count, street in BOARD_COUNT_MILESTONES:
             if local_count >= count and street not in headers:
                 headers.add(street)
-                self._emit_line(f"[{street}] 보드: {count}장", "street_header")
+                self._emit_line(f"[{street}] 보드: {count}장", "street_header", hand_no, street)
                 self._submit_board_cards(table_img, hand_no, street)
 
     def _submit_board_cards(self, table_img, hand_no: int, street: str) -> None:
@@ -330,26 +424,41 @@ class DealerChatBridge:
         if hand_no in self._folded_hands:
             return
         key = (hand_no, street)
-        if key in self._board_attempted:
+        attempts = self._board_attempts.get(key, 0)
+        if attempts >= MAX_BOARD_ATTEMPTS:
             return
-        self._board_attempted.add(key)
+        self._board_attempts[key] = attempts + 1
 
         table_layout = load_table_layout()
         board_region_px = resolve_ratio_region(table_layout.board_region, table_img.size)
         local_count = self._local_board_count(table_img)
+        # task.md "보드 장수 감지 수정": 이번 제출 시점의 밝은 폭도 같이 재둔다 -
+        # AI 응답이 돌아와서 실제 장수를 알게 되면(_on_board_cards_done) 이 폭을
+        # 그 장수로 나눠서 이 세션의 실제 카드 폭을 역산/학습한다.
+        try:
+            raw_width = board_reader.measure_bright_width(table_img, board_region_px)
+        except Exception:
+            raw_width = 0
         try:
             crop = table_img.crop(board_region_px)
         except Exception:
             crop = None
 
+        # task.md "보드 카드 재확인 흔들림 수정": 이 핸드에서 이미 확정된 카드가
+        # 있으면(이전 스트리트) 그대로 넘겨서 AI가 새로 추가된 카드만 읽게 한다.
+        known_cards = self._confirmed_board_cards.get(hand_no, [])
         future = self._ai_executor.submit(
-            card_reader.read_board_cards, crop, local_count or expected_count, f"hand{hand_no}_{street}"
+            card_reader.read_board_cards,
+            crop, local_count or expected_count, f"hand{hand_no}_{street}", known_cards,
         )
         future.add_done_callback(
-            lambda f, hand_no=hand_no, street=street: self._on_board_cards_done(f, hand_no, street)
+            lambda f, hand_no=hand_no, street=street, raw_width=raw_width, expected_count=expected_count:
+                self._on_board_cards_done(f, hand_no, street, raw_width, expected_count)
         )
 
-    def _on_board_cards_done(self, future, hand_no: int, street: str) -> None:
+    def _on_board_cards_done(
+        self, future, hand_no: int, street: str, raw_width: int = 0, expected_count: int = 0
+    ) -> None:
         # task4.md "이미 진행 중인 보드 AI 요청이 있으면 결과를 버리거나 무시":
         # 제출 시점엔 안 폴드였어도, 응답이 도착하는 사이 히어로가 폴드했을 수
         # 있다 - 그 사이 값이면 결과를 그냥 버린다(로그/엑셀에 안 남김).
@@ -359,13 +468,37 @@ class DealerChatBridge:
             cards = future.result()
         except Exception:
             cards = ""
+        count = len(cards.split()) if cards else 0
+
+        # task.md "보드 카드 인식 개선": 읽은 장수가 기대 장수와 다르면(예: 3장이
+        # 맞는데 2장만 읽음) 재시도 여지가 남아있는 한 번 더 시도한다 - 홀카드와
+        # 달리 폴링에서 반복 호출되지 않으므로 여기서 직접 재제출한다.
+        key = (hand_no, street)
+        if count != expected_count and self._board_attempts.get(key, 0) < MAX_BOARD_ATTEMPTS:
+            table_img = self._capture_table_img()
+            if table_img is not None:
+                self._submit_board_cards(table_img, hand_no, street)
+                return
+            # table_img를 못 얻으면 재시도를 포기하고 지금 결과라도 기록한다.
+
+        # task.md "보드 장수 감지 수정": AI가 실제로 읽은 장수(신뢰할 수 있는
+        # 정답)로 이 세션의 카드 폭을 역산해서 학습해둔다 - 다음 스트리트/핸드부터
+        # 로컬 장수 판별(_local_board_count)이 이 값을 쓴다. 카드를 하나도 못
+        # 읽었거나 폭을 못 쟀으면 학습하지 않는다(잘못된 값으로 덮어쓰지 않기 위해).
+        if count > 0 and raw_width > 0:
+            self._board_card_unit_width = raw_width / count
+        # task.md "보드 카드 재확인 흔들림 수정": 기대 장수와 정확히 맞은 경우에만
+        # "확정"으로 잠그고 다음 스트리트에 고정값으로 넘긴다 - 장수가 안 맞으면
+        # (재시도까지 다 썼는데도) 잘못된 카드로 잠그지 않는다.
+        if count == expected_count and cards:
+            self._confirmed_board_cards[hand_no] = cards.split()
         # task.md "로그 안정화 4종" 3절: 장수는 AI가 실제로 읽은 개수를 그대로
         # 쓴다(스트리트 이름에 억지로 안 맞춘다). AI가 아예 못 읽었으면 조용히
         # 넘어간다 - 스트리트 헤더 찍을 때 이미 로컬 판별 장수를 보여줬으므로
-        # "0장" 같은 줄을 새로 찍어서 혼란을 더할 필요는 없다.
+        # "0장" 같은 줄을 새로 찍어서 혼란을 더할 필요는 없다. task.md "출력 두
+        # 영역 분리": 카드 상세 채널로만 나간다 - 메인 기록엔 영향 없음.
         if cards:
-            count = len(cards.split())
-            self._emit_line(f"[{street}] 보드 확인: {count}장 ({cards})", "street_header")
+            self._emit_card_line(f"[{street}] 보드 확인: {count}장 ({cards})", "street_header", hand_no, street)
         self._log_card_row(hand_no, street, "보드", cards)
 
     def _log_to_xlsx(self, row, hand_no: int) -> None:
@@ -427,6 +560,8 @@ class DealerChatBridge:
                     self._cur_hand_no = item.hand_no
                     self._cur_hand_board_count = 0
                     self._cur_hand_headers = set()
+                    self._board_count_candidate = 0
+                    self._board_count_candidate_streak = 0
 
                 if item.tag == "street_header":
                     street_name = item.text.strip("[]")
@@ -436,11 +571,20 @@ class DealerChatBridge:
                         continue
                     self._cur_hand_headers.add(street_name)
                     text = self._street_header_text(table_img, street_name)
-                    self._emit_line(text, item.tag)
+                    self._emit_line(text, item.tag, item.hand_no, street_name)
                     self._submit_board_cards(table_img, item.hand_no, street_name)
                     continue
 
-                self._emit_line(item.text, item.tag)
+                # task.md "출력 두 영역 분리": 메인 기록은 AI와 완전히 무관하게
+                # 항상 즉시 나간다(카드 상세는 _emit_card_line을 통해 별도
+                # 채널로만 나가므로, 여기선 기다릴 이유가 없다). task.md "표
+                # 통합 UI": hand_header 줄은 프리플랍 취급(홀카드가 붙는 자리),
+                # 그 외 행동 줄은 그 행의 실제 스트리트를 같이 넘긴다.
+                row_street = (
+                    self._recorder.layout.streets[0] if item.tag == "hand_header"
+                    else (item.row.street if item.row is not None else "")
+                )
+                self._emit_line(item.text, item.tag, item.hand_no, row_street)
                 if item.row is not None:
                     self._log_to_xlsx(item.row, item.hand_no)
                 # 홀카드 첫 시도는 이 for 루프가 끝난 뒤 self._cur_hand_no 기준
@@ -454,6 +598,17 @@ class DealerChatBridge:
             # 로컬 보드 장수 보정 블록이 유일하게 남는 누출 경로였다.
             if self._recorder._hero_folded_this_hand:
                 self._folded_hands.add(self._cur_hand_no)
+
+            # task.md "참가인원(추정) 표시": 방금 핸드가 하나 끝나서 recorder가
+            # 그 핸드의 안티 인원수를 남겨뒀으면(안티가 하나도 없던 핸드는 갱신
+            # 안 됨 - recorder 쪽 주석 참고), 카드 상세 채널로 한 번만 내보낸다.
+            # 타이밍은 상관없다는 게 지시서 전제라, 다음 핸드가 시작되는 시점에
+            # 늦게 나가도 된다 - 새로운 대기/큐 로직 없이 그냥 확인만 한다.
+            last_hand_no = self._recorder.last_participant_hand_no
+            if last_hand_no and last_hand_no not in self._participant_count_emitted_for:
+                self._participant_count_emitted_for.add(last_hand_no)
+                count = self._recorder.last_participant_count
+                self._emit_card_line(f"참가인원(추정): {count}명", "participants", last_hand_no, "")
 
             # task.md "히어로 탈락 감지 및 기록 자동 중지": 히어로 닉네임을 사용자가
             # 직접 설정했을 때만 판단 대상이다(좌석 OCR 자동 인식 모드는 자리 주인이
@@ -469,7 +624,7 @@ class DealerChatBridge:
             ):
                 self._hero_missing_stop_triggered = True
                 warning = "히어로가 테이블에서 보이지 않습니다. 기록을 중지합니다."
-                self._emit_line(warning, "result")
+                self._emit_line(warning, "result", self._cur_hand_no, "")
                 self._emit_status(warning)
                 self._emit_hero_missing()
                 self._stop_flag.set()
@@ -523,9 +678,26 @@ class DealerChatBridge:
                 # 루프에서 recorder가 street_header를 절대 안 준다 - 로컬 보드 장수
                 # 증가를 독립 신호로 써서 그런 헤더도 강제로 채운다. 장수가
                 # 줄어들거나 같으면 무시하고(아래 비교), 행동 줄은 만들지 않는다.
+                #
+                # task.md "보드 장수 디바운스": 한 번 올라간 값을 바로 확정하지
+                # 않는다 - 같은 값이 연속 BOARD_COUNT_CONFIRM_STREAK번 이상
+                # 나와야 진짜로 올라간 것으로 본다(핸드 쪼개짐 디바운스와 같은
+                # 패턴). 값이 도중에 확정된 장수 이하로 돌아오면 그 후보는
+                # 오측정이었던 것이므로 버린다.
                 if local_count > self._cur_hand_board_count:
-                    self._emit_board_milestones(table_img, self._cur_hand_no, self._cur_hand_headers, local_count)
-                    self._cur_hand_board_count = local_count
+                    if local_count == self._board_count_candidate:
+                        self._board_count_candidate_streak += 1
+                    else:
+                        self._board_count_candidate = local_count
+                        self._board_count_candidate_streak = 1
+                    if self._board_count_candidate_streak >= BOARD_COUNT_CONFIRM_STREAK:
+                        self._emit_board_milestones(table_img, self._cur_hand_no, self._cur_hand_headers, local_count)
+                        self._cur_hand_board_count = local_count
+                        self._board_count_candidate = 0
+                        self._board_count_candidate_streak = 0
+                else:
+                    self._board_count_candidate = 0
+                    self._board_count_candidate_streak = 0
 
             if was_syncing and not self._recorder.syncing:
                 # task.md "기록 시작 동기화" 4절: 동기화가 막 끝났다 - 실패로

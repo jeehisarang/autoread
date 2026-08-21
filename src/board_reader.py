@@ -6,6 +6,15 @@
 밝은 부분의 가로 폭을 재고 카드 1장의 대략적인 폭으로 나눠 몇 장이 나왔는지
 추정한다. 카드 내부 그림(문양) 때문에 밝기가 잠깐씩 떨어지는 것에 영향받지
 않도록, 개별 카드 사이 경계를 찾지 않고 전체 밝은 영역의 시작~끝 폭만 잰다.
+
+task.md "보드 장수 감지 수정"(2026-08-21): 카드 1장의 폭(CARD_UNIT_WIDTH)은
+테이블/방마다 렌더링 크기가 달라서 고정 상수 하나로는 한계가 있다(실측 확인:
+어떤 6인 테이블은 실제 카드 폭이 66px 보정값보다 작아서, 리버 5장이 계속
+4장으로만 잡혔다 - 295px÷66≈4.47이 반올림으로 4가 됨). 그래서 `detect_card_count`
+에 `card_unit_width`를 선택적으로 받게 하고, 호출부(dealer_chat_bridge.py)가
+AI가 실제로 읽어낸 카드 개수(신뢰할 수 있는 정답)로 그 세션의 실제 카드 폭을
+역산해서 넘겨주게 한다 - `measure_bright_width`가 그 역산에 쓸 폭 측정 값을
+공개한다. 넘겨받은 값이 없으면(세션 시작 직후 등) 기존 기본값을 그대로 쓴다.
 """
 from PIL import Image
 
@@ -14,8 +23,10 @@ from PIL import Image
 # 카드로 오인했다(실측: 로고=밝은 폭 108px, 카드 3장=132px, 겹치는 범위). 임계값을
 # 190까지 올리면 로고(0px)와 실제 카드(132px)가 깔끔히 갈린다.
 BRIGHT_THRESHOLD = 190  # 카드(밝음) vs 테이블 펠트/로고(어두움) 판정 기준
-CARD_UNIT_WIDTH = 66.0  # 카드 1장의 대략적인 가로 폭(px). 영상마다 카드 렌더링 크기가
-# 달라서(실측: 이전 영상 44~49px/장, 이번 영상 66px/장) 좌표 재실측 때마다 같이 조정 필요.
+# 카드 1장의 대략적인 가로 폭(px) 기본값 - 호출부가 실측 보정값(card_unit_width)을
+# 안 넘겨줄 때만 쓰는 폴백이다(영상마다 카드 렌더링 크기가 달라서 이 상수 하나로는
+# 모든 테이블에 안 맞는다 - 위 모듈 설명 참고).
+CARD_UNIT_WIDTH = 66.0
 VALID_COUNTS = (0, 3, 4, 5)
 
 STREET_BY_COUNT = {0: "프리플랍", 3: "플랍", 4: "턴", 5: "리버"}
@@ -35,8 +46,10 @@ def _column_brightness(px, x, y0, y1) -> float:
     return total / n if n else 0.0
 
 
-def detect_card_count(img: Image.Image, board_region: tuple[int, int, int, int]) -> int:
-    """board_region 안에 카드가 몇 장 나와 있는지 추정한다. 결과는 항상 0/3/4/5 중 하나."""
+def measure_bright_width(img: Image.Image, board_region: tuple[int, int, int, int]) -> int:
+    """board_region 안에서 밝은 영역(카드가 있는 부분)의 가로 폭(px)을 잰다.
+    카드가 하나도 없으면 0. detect_card_count와 dealer_chat_bridge.py의 카드 폭
+    자동 보정(AI가 읽은 실제 장수로 역산) 둘 다 이 측정값을 재사용한다."""
     x1, y1, x2, y2 = board_region
     crop = img.crop((x1, y1, x2, y2)).convert("RGB")
     w, h = crop.size
@@ -60,8 +73,23 @@ def detect_card_count(img: Image.Image, board_region: tuple[int, int, int, int])
             right = x
             break
 
-    width = (right - left + 1) if right is not None else 0
-    estimated = round(width / CARD_UNIT_WIDTH)
+    return (right - left + 1) if right is not None else 0
+
+
+def detect_card_count(
+    img: Image.Image,
+    board_region: tuple[int, int, int, int],
+    card_unit_width: float | None = None,
+) -> int:
+    """board_region 안에 카드가 몇 장 나와 있는지 추정한다. 결과는 항상 0/3/4/5 중 하나.
+
+    card_unit_width를 주면(호출부가 그 테이블에서 실측 보정한 값) 그걸로 나누고,
+    안 주면(기존 recorder.py 등 호환용) 기본 CARD_UNIT_WIDTH를 그대로 쓴다."""
+    width = measure_bright_width(img, board_region)
+    if width == 0:
+        return 0
+    unit = card_unit_width if card_unit_width and card_unit_width > 0 else CARD_UNIT_WIDTH
+    estimated = round(width / unit)
     return min(VALID_COUNTS, key=lambda c: abs(c - estimated))
 
 

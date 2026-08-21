@@ -37,7 +37,24 @@ HOLE_CARDS_PROMPT = (
 )
 
 
-def _board_prompt(expected_count: int) -> str:
+def _board_prompt(expected_count: int, known_cards: list[str] | None = None) -> str:
+    if known_cards:
+        # task.md "보드 카드 재확인 흔들림 수정": 스트리트마다 보드 전체를 매번
+        # 새로 읽으면, 이미 확정된 카드까지 다시 읽히면서 같은 카드가 스트리트별로
+        # 다른 무늬/랭크로 보이는 흔들림이 실측 확인됐다(예: 플랍에서 Qd였던 카드가
+        # 턴/리버에선 Qh로 읽힘). 이미 확인된 카드는 고정값으로 알려주고, AI에게는
+        # "새로 추가된 카드만" 읽게 해서 이미 맞은 카드를 다시 흔들 여지 자체를 없앤다.
+        new_count = expected_count - len(known_cards)
+        known_str = " ".join(known_cards)
+        return (
+            f"이 이미지는 홀덤 테이블의 보드(커뮤니티) 카드 영역을 잘라낸 것이다. "
+            f"왼쪽부터 {len(known_cards)}장은 이미 확인된 카드로 {known_str}이다 - 이 카드들은 "
+            f"다시 읽지 않아도 된다(정답으로 그대로 쓸 것이다). 그 뒤에 새로 추가된 카드 "
+            f"{new_count}장만 왼쪽부터 순서대로 랭크+무늬로 읽어라(랭크: 2-9,T,J,Q,K,A / "
+            "무늬: s,h,d,c). 확신이 안 서는 카드는 억지로 추측하지 말고 빼라.\n"
+            '설명 없이 JSON만 답하라: {"cards": ["7h", "2c"]} 형식(이미 확인된 카드는 '
+            "포함하지 말고, 새로 추가된 카드만)."
+        )
     return (
         f"이 이미지는 홀덤 테이블의 보드(커뮤니티) 카드 영역을 잘라낸 것이다. 지금 이 "
         f"시점에는 카드가 {expected_count}장 깔려 있어야 한다.\n"
@@ -152,14 +169,26 @@ def read_hero_hole_cards(hole_cards_img, reason: str = "hole_cards") -> str:
     return cards
 
 
-def read_board_cards(board_img, expected_count: int, reason: str = "board") -> str:
-    """보드 카드를 "As 7h 2c" 형식으로 반환한다. 실패/미확신이면 빈 문자열."""
+def read_board_cards(
+    board_img, expected_count: int, reason: str = "board", known_cards: list[str] | None = None
+) -> str:
+    """보드 카드를 "As 7h 2c" 형식으로 반환한다. 실패/미확신이면 빈 문자열.
+
+    known_cards를 주면(이전 스트리트에서 이미 확정된 카드) AI에게 새로 추가된
+    카드만 읽게 하고, 결과에 known_cards를 그대로 앞에 붙여 돌려준다(task.md
+    "보드 카드 재확인 흔들림 수정" - 이미 맞은 카드가 스트리트마다 다시 흔들리는
+    문제를 애초에 다시 안 물어봐서 없앤다)."""
     if board_img is None or expected_count <= 0:
         return ""
-    data, latency, fail_reason = _call_vision_json(board_img, _board_prompt(expected_count), reason)
+    known_cards = known_cards or []
+    new_needed = expected_count - len(known_cards)
+    if new_needed <= 0:
+        return " ".join(known_cards)
+    data, latency, fail_reason = _call_vision_json(board_img, _board_prompt(expected_count, known_cards), reason)
     if data is None:
         _log(reason, False, latency, fail_reason)
         return ""
-    cards = _format_cards(data.get("cards"), max_count=expected_count)
+    new_cards = _format_cards(data.get("cards"), max_count=new_needed)
+    cards = " ".join(known_cards + new_cards.split()) if known_cards else new_cards
     _log(reason, True, latency, f"cards={cards!r}")
     return cards

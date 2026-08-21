@@ -17,6 +17,7 @@
 import os
 import sys
 import tkinter as tk
+from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,13 +31,26 @@ from src import ocr_engine, table_layout, window_capture
 from src.dealer_chat_bridge import DealerChatBridge
 from src.xlsx_writer import XlsxLogger
 
-FONT_NORMAL = ("맑은 고딕", 12)
-FONT_BOLD = ("맑은 고딕", 13, "bold")
-FONT_BIG = ("맑은 고딕", 15, "bold")
-FONT_LOG = ("Consolas", 13)
-FONT_LOG_HEADER = ("Consolas", 14, "bold")
+# task.md "표(그리드) 통합 UI": 상단 컨트롤 영역이 기록 표보다 화면을 더 많이
+# 차지하던 걸 줄이려고 전반적으로 폰트를 한 단계씩 줄였다(기존 12/13/15 ->
+# 10/11/12) - "정작 중요한 기록칸이 작고 글씨는 너무 크다"는 피드백 반영.
+FONT_NORMAL = ("맑은 고딕", 10)
+FONT_BOLD = ("맑은 고딕", 11, "bold")
+FONT_BIG = ("맑은 고딕", 12, "bold")
+FONT_GRID = ("Consolas", 11)
+FONT_GRID_HEADER = ("맑은 고딕", 10, "bold")
 
 HERO_COLOR = "#1B7A1B"  # 내 행동 강조색 (초록)
+
+# task.md "표(그리드) 통합 UI": 메인 기록(딜러 채팅 순서 그대로)과 카드 상세
+# (AI 인식 결과, 늦게 나올 수 있음)를 예전엔 별도 패널 두 개로 나눴는데, 이번엔
+# 엑셀처럼 표 하나로 합친다 - 카드 인식 결과가 나중에 도착하면 새 줄을 추가하는
+# 대신 그 정보가 속한 게임/스트리트의 "행"을 찾아 카드 칸만 채워 넣는다. 그러면
+# 화면에 뜨는 시각은 지금처럼 늦어도 되면서(요구사항 그대로), 시각적으로는
+# 정확히 같은 가로줄(같은 게임/스트리트)에 나란히 보인다 - 실제 저장되는
+# xlsx에 hand_no/street가 모든 행에 이미 같이 저장되는 것과 동일한 대응관계를
+# 화면에서도 그대로 재현한 것뿐이라, 새로운 타이밍/대기 로직은 전혀 없다.
+GRID_ROW_TAGS = ("hand_header", "street_header", "result", "hero_action", "action")
 
 # 프로그램을 여러 개 동시에 켜면 같은 xlsx 파일에 서로 저장을 시도하면서 충돌하고
 # 행동이 누락되는 문제가 있었다. Windows 뮤텍스로 중복 실행 자체를 막는다 - 이 이름의
@@ -49,7 +63,9 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("홀덤 게임 텍스트 기록 프로그램")
-        self.root.geometry("880x640")
+        # task.md "표(그리드) 통합 UI": 표 열(시간/게임/스트리트/기록/카드)이
+        # 다 들어가도록 기존보다 넓히고, 압축된 컨트롤 덕분에 표 영역도 키운다.
+        self.root.geometry("1180x720")
 
         self.cfg = cfg_mod.load_config()
 
@@ -79,6 +95,13 @@ class App:
 
         self.recorder: DealerChatBridge | None = None
         self.xlsx_logger: XlsxLogger | None = None
+
+        # task.md "표(그리드) 통합 UI": 카드 인식 결과가 나중에 도착했을 때 어느
+        # 행(hand_header 또는 street_header 행)에 채워 넣을지 찾기 위한 표.
+        # hand_no는 세션마다 계속 증가만 하므로 리셋 없이 멤버십만 확인해도 된다
+        # (다른 모듈들과 같은 관례).
+        self._grid_row_for_hand: dict = {}  # hand_no -> Treeview item id
+        self._grid_row_for_street: dict = {}  # (hand_no, street) -> Treeview item id
 
         self._build_ui()
         self._check_ocr_language()
@@ -163,25 +186,57 @@ class App:
         self.lbl_status = tk.Label(self.root, text="상태: 대기 중", font=FONT_BOLD, fg="#333", anchor="w")
         self.lbl_status.pack(fill="x", padx=10)
 
-        log_frame = tk.Frame(self.root)
-        log_frame.pack(fill="both", expand=True, padx=10, pady=10)
-        tk.Label(log_frame, text="실시간 인식 기록 (아래로 갈수록 최신)", font=FONT_NORMAL, anchor="w").pack(fill="x")
+        # task.md "표(그리드) 통합 UI": 메인 기록과 카드 상세를 표 하나로 합친다
+        # (아래 _build_grid 참고) - 카드 인식 결과는 늦게 나와도 같은 행에 채워
+        # 넣힐 뿐, 새 타이밍/대기 로직은 없다(기존 즉시 출력 그대로).
+        grid_frame = tk.Frame(self.root)
+        grid_frame.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+        self._build_grid(grid_frame)
 
-        text_container = tk.Frame(log_frame)
-        text_container.pack(fill="both", expand=True)
-        scrollbar = tk.Scrollbar(text_container)
-        scrollbar.pack(side="right", fill="y")
-        self.txt_log = tk.Text(text_container, font=FONT_LOG, yscrollcommand=scrollbar.set, wrap="word")
-        self.txt_log.pack(side="left", fill="both", expand=True)
-        scrollbar.config(command=self.txt_log.yview)
+    def _build_grid(self, parent) -> None:
+        style = ttk.Style()
+        style.configure("Log.Treeview", font=FONT_GRID, rowheight=22)
+        style.configure("Log.Treeview.Heading", font=FONT_GRID_HEADER)
 
-        self.txt_log.tag_configure("hand_header", font=FONT_LOG_HEADER, foreground="#0D47A1")
-        self.txt_log.tag_configure("street_header", font=FONT_LOG_HEADER, foreground="#4A148C")
-        self.txt_log.tag_configure("result", font=FONT_LOG_HEADER, foreground="#B71C1C")
-        self.txt_log.tag_configure("hero_action", font=FONT_LOG, foreground=HERO_COLOR)
-        self.txt_log.tag_configure("action", font=FONT_LOG, foreground="#000000")
+        container = tk.Frame(parent)
+        container.pack(fill="both", expand=True)
+        vscroll = ttk.Scrollbar(container, orient="vertical")
+        vscroll.pack(side="right", fill="y")
 
-        self.txt_log.configure(state="disabled")
+        columns = ("time", "hand", "street", "main", "card", "participants")
+        tree = ttk.Treeview(
+            container, columns=columns, show="headings", style="Log.Treeview",
+            yscrollcommand=vscroll.set,
+        )
+        vscroll.config(command=tree.yview)
+        tree.pack(side="left", fill="both", expand=True)
+
+        headings = {
+            "time": ("시간", 68, False),
+            "hand": ("게임", 44, False),
+            "street": ("스트리트", 62, False),
+            "main": ("기록 (딜러 채팅 순서 그대로)", 380, True),
+            "card": ("카드 인식 결과 (AI, 늦게 나올 수 있음)", 260, True),
+            # task.md "참가인원(추정) 표시": 안티 낸 사람 수 기반 추정치라 100%
+            # 확정은 아니라는 걸 열 제목에도 남긴다.
+            "participants": ("참가인원(추정)", 96, False),
+        }
+        for col, (label, width, stretch) in headings.items():
+            tree.heading(col, text=label)
+            tree.column(col, width=width, minwidth=40, stretch=stretch, anchor="w")
+
+        tree.tag_configure("hand_header", foreground="#0D47A1", background="#E8F0FD")
+        tree.tag_configure("street_header", foreground="#4A148C", background="#F3E9FB")
+        tree.tag_configure("result", foreground="#B71C1C", background="#FDECEC")
+        tree.tag_configure("hero_action", foreground=HERO_COLOR)
+        tree.tag_configure("action", foreground="#000000")
+
+        self.tree_log = tree
+
+    def _clear_grid(self) -> None:
+        self.tree_log.delete(*self.tree_log.get_children())
+        self._grid_row_for_hand = {}
+        self._grid_row_for_street = {}
 
     def _check_ocr_language(self):
         if not ocr_engine.is_language_available(self.ocr_lang):
@@ -309,9 +364,7 @@ class App:
             messagebox.showerror("오류", f"엑셀 파일을 열 수 없습니다: {e}")
             return
 
-        self.txt_log.configure(state="normal")
-        self.txt_log.delete("1.0", "end")
-        self.txt_log.configure(state="disabled")
+        self._clear_grid()
 
         table_layout.set_active_table_type(self.table_type_var.get())
 
@@ -323,6 +376,7 @@ class App:
             ocr_lang=self.ocr_lang,
             hero_nickname=self.hero_nickname_var.get().strip(),
             on_line=self._on_line,
+            on_card_line=self._on_card_line,
             on_status=self.set_status,
             on_hero_missing=self.on_hero_missing,
         )
@@ -341,16 +395,45 @@ class App:
         self.set_status("상태: 대기 중")
 
     # ---------- 콜백 (백그라운드 스레드에서 호출되므로 after로 UI 스레드에 전달) ----------
-    def _on_line(self, text, tag):
-        self.root.after(0, lambda: self._append_log(text, tag))
+    def _on_line(self, text, tag, hand_no, street):
+        self.root.after(0, lambda: self._append_grid_row(text, tag, hand_no, street))
 
-    def _append_log(self, text, tag):
-        self.txt_log.configure(state="normal")
-        if tag in ("hand_header", "street_header", "result"):
-            self.txt_log.insert("end", "\n")
-        self.txt_log.insert("end", text + "\n", tag)
-        self.txt_log.see("end")
-        self.txt_log.configure(state="disabled")
+    def _on_card_line(self, text, tag, hand_no, street):
+        # task.md "표(그리드) 통합 UI": 새 행을 추가하는 대신, 이 결과가 속한
+        # 게임(hand_header)/스트리트(street_header)의 행을 찾아 "카드 인식 결과"
+        # 칸만 채운다 - AI 응답이 늦게 와도 메인 기록 순서/행 배치엔 영향 없다.
+        self.root.after(0, lambda: self._fill_card_cell(text, tag, hand_no, street))
+
+    def _append_grid_row(self, text, tag, hand_no, street):
+        now = datetime.now().strftime("%H:%M:%S")
+        item = self.tree_log.insert(
+            "", "end", values=(now, hand_no or "", street, text, "", ""), tags=(tag,),
+        )
+        self.tree_log.see(item)
+        # task.md "표(그리드) 통합 UI": 나중에 카드 인식 결과가 도착했을 때 이
+        # 행을 다시 찾아올 수 있도록 기억해둔다 - hand_header는 히어로 홀카드/
+        # 참가인원(추정)이, street_header는 그 스트리트의 보드 확인 결과가
+        # 여기로 채워진다.
+        if tag == "hand_header" and hand_no:
+            self._grid_row_for_hand[hand_no] = item
+        elif tag == "street_header" and hand_no:
+            self._grid_row_for_street[(hand_no, street)] = item
+
+    def _fill_card_cell(self, text, tag, hand_no, street):
+        # task.md "참가인원(추정) 표시": 별도 열("participants")에 채운다 -
+        # 카드 인식 결과 열과 안 섞이게. hand_header 행(그 핸드의 "[N게임 시작]")
+        # 을 그대로 재사용한다.
+        column = "participants" if tag == "participants" else "card"
+        if tag in ("hand_header", "participants"):
+            item = self._grid_row_for_hand.get(hand_no)
+        else:
+            item = self._grid_row_for_street.get((hand_no, street))
+        if item is None or not self.tree_log.exists(item):
+            # 해당 행을 못 찾으면(예: 아주 드물게 순서가 어긋난 경우) 조용히
+            # 새 행으로라도 남겨서 정보 자체가 유실되지는 않게 한다.
+            self._append_grid_row(text, tag, hand_no, street)
+            return
+        self.tree_log.set(item, column, text)
 
     def set_status(self, text: str):
         self.root.after(0, lambda: self.lbl_status.config(text=f"상태: {text}"))
